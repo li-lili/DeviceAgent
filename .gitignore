@@ -1,0 +1,18 @@
+# 编译产物与临时文件
+build/
+out/
+run/
+tmp/
+
+# 业务日志
+business-logs/
+
+# 编辑器本地配置与缓存
+.vs/
+.vscode/
+__pycache__/
+*.pyc
+
+# 真实凭证；只提交 .example 模板
+/device-agent.cloud.conf
+*.token

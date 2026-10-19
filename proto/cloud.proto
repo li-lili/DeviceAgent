@@ -1,0 +1,62 @@
+syntax = "proto3";
+package logserver.v1;
+
+// Wire-compatible subset of interface-spec.pdf, appendix D.
+// Field 7 of CollectLogsArgs is a PROPOSED extension, used by the mock cloud.
+message Time { int64 wall_ns = 1; int64 mono_ns = 2; }
+message Hello {
+  string device_id = 1; string boot_id = 2; string model = 3;
+  string firmware_version = 4; string software_version = 5;
+  map<string,string> tags = 6; int64 sent_wall_ns = 7;
+  map<string,uint64> pending_seq = 8; string protocol_version = 9;
+  repeated string pending_boot_ids = 10;
+}
+message Presence { bool online = 1; string boot_id = 2; int64 sent_wall_ns = 3; }
+message HelloReply { int64 server_time_ns = 1; uint32 config_version = 2; map<string,uint64> acked_seq = 3; }
+message Component {
+  string id = 1; string parent_id = 2; string type = 3; string name = 4;
+  string hw_model = 5; string hw_serial = 6; string hw_revision = 7;
+  string fw_version = 8; map<string,string> attrs = 9;
+}
+message SoftwareItem { string name = 1; string version = 2; string build = 3; string git_sha = 4; string kind = 5; map<string,string> attrs = 6; }
+message Inventory {
+  string device_id = 1; string boot_id = 2; Time time = 3;
+  string model = 4; string serial = 5; string os = 6;
+  repeated Component components = 7; repeated SoftwareItem software = 8;
+}
+enum LogSelectionMode { LOG_SELECTION_MODE_UNSPECIFIED = 0; TIME_RANGE = 1; LATEST_FILE = 2; }
+message CollectLogsArgs {
+  int64 time_from_ns = 1; int64 time_to_ns = 2;
+  repeated string sources = 3;
+  reserved 4; // Whole-file collection does not filter log levels.
+  reserved "min_level";
+  uint64 max_bundle_bytes = 5; string reason = 6;
+  LogSelectionMode selection_mode = 7; // Mock-only extension until cloud adopts it.
+}
+message Command {
+  string command_id = 1; int64 issued_at_ns = 2; int64 expires_at_ns = 3;
+  oneof payload { CollectLogsArgs collect_logs = 10; }
+}
+enum CommandStatus {
+  COMMAND_STATUS_UNSPECIFIED = 0; CMD_ACCEPTED = 1; CMD_RUNNING = 2;
+  CMD_SUCCEEDED = 3; CMD_FAILED = 4; CMD_REJECTED = 5;
+}
+message CollectLogsResult {
+  string file_id = 1; uint64 size_bytes = 2; string sha256 = 3;
+  int64 time_from_ns = 4; int64 time_to_ns = 5; bool truncated = 6;
+  repeated string included_sources = 7;
+}
+message CommandResult {
+  string command_id = 1; CommandStatus status = 2; uint32 progress_pct = 3;
+  string error_code = 4; string message = 5; Time time = 6;
+  oneof result { CollectLogsResult collect_logs = 10; }
+}
+message UploadRequest {
+  string command_id = 1; string filename = 2; uint64 size_bytes = 3;
+  string sha256 = 4; string content_type = 5;
+}
+message UploadGrant {
+  string command_id = 1; bool granted = 2; string reject_reason = 3;
+  string file_id = 4; string storage_key = 5; string uptoken = 6;
+  repeated string up_hosts = 7; int64 expires_at_ns = 8; uint64 max_size_bytes = 9;
+}

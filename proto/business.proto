@@ -1,0 +1,24 @@
+syntax = "proto3";
+package deviceagent.business.v1;
+
+// Business publishes a complete configuration after every MQTT connection.
+// Path permissions remain controlled by the Agent's --allowed-root.
+message LogSource {
+  string source_id = 1;
+  string path = 2;
+  bool recursive = 3;
+  repeated string file_patterns = 4;
+  reserved 5, 6; // Removed log-content timestamp format and timezone.
+  reserved "time_format", "timezone";
+}
+message Registration {
+  string business_id = 1;
+  uint64 config_version = 2;
+  repeated LogSource log_sources = 3;
+}
+message RegistrationAck {
+  string business_id = 1;
+  uint64 config_version = 2;
+  bool accepted = 3;
+  string message = 4;
+}
