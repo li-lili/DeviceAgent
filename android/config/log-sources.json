@@ -1,0 +1,21 @@
+{
+  // 相对于 /data/vendor/logagent；与实际业务写入的目录保持一致。
+  "log_sources": [
+    {
+      "source_id": "business",
+      "path": "business-logs/app",
+      "recursive": true,
+      "file_patterns": ["*.log", "*.txt"],
+      // %Y=四位年，%m=两位月，%d=两位日；可填写多个格式。
+      "filename_date_formats": ["%Y-%m-%d", "%Y%m%d"]
+    },
+    {
+      "source_id": "camera_sdk",
+      "path": "business-logs/sdk",
+      "recursive": true,
+      "file_patterns": ["*.log", "*.txt"],
+      // %Y=四位年，%m=两位月，%d=两位日；可填写多个格式。
+      "filename_date_formats": ["%Y-%m-%d", "%Y%m%d"]
+    }
+  ]
+}

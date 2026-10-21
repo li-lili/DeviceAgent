@@ -1,0 +1,8 @@
+service vendor.logagent /vendor/bin/device-agent
+    user system
+    group system inet
+    disabled
+    restart_period 10
+
+on property:sys.boot_completed=1
+    start vendor.logagent

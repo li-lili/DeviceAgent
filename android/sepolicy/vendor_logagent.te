@@ -1,0 +1,18 @@
+# 集成示例：加入设备的 vendor sepolicy 目录，并按实际日志目录收窄权限。
+type vendor_logagent, domain;
+type vendor_logagent_exec, exec_type, vendor_file_type, file_type;
+type vendor_logagent_data_file, file_type, data_file_type;
+type vendor_logagent_log_file, file_type, data_file_type;
+
+init_daemon_domain(vendor_logagent)
+net_domain(vendor_logagent)
+# 允许原生服务向 logd 写入 Logcat。
+write_logd(vendor_logagent)
+
+# 仅允许服务在自己的数据目录内读写配置、Token、命令缓存和临时包。
+allow vendor_logagent vendor_logagent_data_file:dir create_dir_perms;
+allow vendor_logagent vendor_logagent_data_file:file create_file_perms;
+
+# 业务日志只读；业务写入进程的权限需由它自己的策略另行授予。
+allow vendor_logagent vendor_logagent_log_file:dir r_dir_perms;
+allow vendor_logagent vendor_logagent_log_file:file r_file_perms;

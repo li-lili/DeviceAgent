@@ -8,6 +8,8 @@ message LogSource {
   string path = 2;
   bool recursive = 3;
   repeated string file_patterns = 4;
+  // Filename date templates; empty defaults to %Y-%m-%d.
+  repeated string filename_date_formats = 7;
   reserved 5, 6; // Removed log-content timestamp format and timezone.
   reserved "time_format", "timezone";
 }

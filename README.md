@@ -4,6 +4,8 @@ C++17 日志采集程序，通过 MQTT 5 + JSON 接收云端命令，按文件�
 
 完整操作见 [云端使用说明](docs/使用说明.md)，包含设备注册、配置、前台启动、日志采集、下载解压与排错。
 
+业务日志配置见 [业务端使用说明](docs/业务端使用说明.md)。
+
 ## 编译
 
 Ubuntu 22.04 / WSL Ubuntu-22.04 中执行：
@@ -49,3 +51,7 @@ cp -n device-agent.cloud.conf.example device-agent.cloud.conf
 | `scripts/`、`tests/`、`mocks/` | 构建及开发验证工具 |
 
 真实云端配置、Token、运行记录、业务日志、编译产物及编辑器缓存已通过 `.gitignore` 排除。请勿使用 `git add -f` 强制提交这些文件。
+
+Android 12 ARM64 原生服务的构建与固件集成见 [Android 部署说明](docs/Android部署说明.md)。
+
+编译和打包命令见 [Android 编译说明](docs/Android编译说明.md)。

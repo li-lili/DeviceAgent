@@ -1,0 +1,75 @@
+# 业务端使用说明
+
+## 1. 云端准备设备码和注册码
+
+在云端控制台完成以下操作：
+
+![alt text](image-1.png)
+1. 进入左侧 **设备管理 → 设备**，点击右上角 **新建设备**。填写设备信息并保存，记录设备 ID，例如图中的 `rbt-001`。将设备 ID 填入 `device-agent.cloud.conf` 的 `device`，不要填写设备显示名称。
+
+![alt text](image-2.png)
+2. 进入左侧 **系统 → 设备注册码**，点击右上角 **创建注册码**。按需要设置有效期、注册数量及设备 ID 前缀、机型限制，创建后复制完整注册码。将注册码填入 `enrollment-key`，不要填写注册码名称（例如图中的 `lza`），也不要填写列表中带省略号的缩略值。
+
+```mermaid
+flowchart LR
+    A[设备管理 → 设备] --> B[右上角：新建设备]
+    B --> C[记录设备 ID：rbt-001]
+    C --> D[device=rbt-001]
+    E[系统 → 设备注册码] --> F[右上角：创建注册码]
+    F --> G[复制完整注册码]
+    G --> H[enrollment-key=完整注册码]
+```
+
+## 2. 填写云端配置
+
+首次配置时，将 `device-agent.cloud.conf.example` 复制为 `device-agent.cloud.conf`，保留部署环境提供的地址及目录配置，填写：
+
+```ini
+# 云端设备 ID，与控制台保持一致。
+device=rbt-001
+# 云端创建后复制的完整注册码。
+enrollment-key=替换为完整注册码
+# 实际设备型号，需符合注册码的机型限制。
+model=devicesim
+```
+
+确认 `device-agent.conf` 中设置了 `environment=cloud`，云端配置中的 `sources-config` 指向下述日志来源文件。
+
+Agent 首次连接时使用注册码获取并缓存 Token，之后重启复用缓存。如果云端提示 `already_enrolled`，联系云端管理员处理或恢复该设备原有 Token。
+
+## 3. 填写日志来源
+
+编辑 Agent 使用的 `log-sources.json`，填写业务日志目录和文件名规则。业务程序正常写日志即可。
+
+```json
+{
+  "log_sources": [
+    {
+      "source_id": "business",
+      "path": "/data/logs/app",
+      "recursive": true,
+      "file_patterns": ["*.txt", "*.log"],
+      "filename_date_formats": ["%Y-%m-%d.txt", "%Y%m%d.txt", "%Y-%m-%d.log"]
+    }
+  ]
+}
+```
+
+| 配置项 | 填写内容 |
+| --- | --- |
+| `source_id` | 日志来源名称，与云端约定，设备内唯一。使用字母、数字、下划线、横线或点，长度 1～64，不能单独为 `.` 或 `..`。 |
+| `path` | 实际日志目录。建议填绝对路径；相对路径以 `log-sources.json` 所在目录为基准。Agent 运行用户需要有目录和文件的读取权限。 |
+| `recursive` | 是否读取子目录：需要填 `true`，不需要填 `false`。 |
+| `file_patterns` | 要采集的文件名规则，例如 `"*.txt"`、`"*.log"`，可填多个。 |
+| `filename_date_formats` | 按天采集时识别文件名日期的格式，可填多个，见下表。仅采集最新文件时可省略。 |
+
+| 实际文件名 | 填写的日期格式 |
+| --- | --- |
+| `2026-10-21.txt` | `%Y-%m-%d.txt` |
+| `20261021.txt` | `%Y%m%d.txt` |
+| `app_2026_10_21.log` | `app_%Y_%m_%d.log` |
+| `21-10-2026.log` | `%d-%m-%Y.log` |
+
+`%Y` 表示四位年，`%m` 表示两位月，`%d` 表示两位日，每种格式必须各包含一次。其他字符按文件名实际内容填写。省略 `filename_date_formats` 时默认识别文件名中的 `2026-10-21` 这类日期；日期按北京时间解释。文件还必须匹配 `file_patterns`。
+
+有多个日志目录时，在 `log_sources` 数组中增加配置项，并使用不同的 `source_id`。修改后重启 Agent 生效。

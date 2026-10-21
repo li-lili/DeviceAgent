@@ -36,7 +36,7 @@ def main():
             "file_patterns": ["*.log"]}]}))
         config = directory / "device-agent.conf"
         config.write_text(chr(10).join([
-            f"port={port}", "allowed-root=logs", "state-dir=state", "work-dir=work",
+            f"port={port}", "host=127.0.0.1", "device=demo-device", "allowed-root=logs", "state-dir=state", "work-dir=work",
             "sources-config=sources.json", "allow-insecure-loopback-upload=true", ""]))
         outputs, processes = [], []
 

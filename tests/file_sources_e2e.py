@@ -24,12 +24,15 @@ def main():
         (logs / "app").mkdir(parents=True)
         expected = b"2026-10-16 12:00:00[INFO]: file configuration test" + bytes([10])
         (logs / "app/current.log").write_bytes(expected)
+        external = directory / "external"
+        external.mkdir()
+        (external / "current.txt").write_bytes(b"external source")
         sources = directory / "sources.json"
 
         def write_sources(source_id="business", path="logs//app"):
             sources.write_text("/* sources config */" + chr(10) + "// line comment" + chr(10) + json.dumps({"log_sources": [{
                 "source_id": source_id, "path": path, "recursive": True,
-                "file_patterns": ["*.log"]}]}) + chr(10) + "// trailing comment")
+                "file_patterns": ["*.log"]}, {"source_id": "sdk", "path": str(external), "file_patterns": ["*.txt"]}]}) + chr(10) + "// trailing comment")
 
         write_sources()
         with socket.socket() as sock:
@@ -42,7 +45,7 @@ def main():
         profiles = directory / "profiles"
         profiles.mkdir()
         (profiles / "local.conf").write_text(chr(10).join([
-            f"port={port}", "allowed-root=../logs", "state-dir=../state", "work-dir=../work",
+            f"port={port}", "host=127.0.0.1", "device=demo-device", "state-dir=../state", "work-dir=../work",
             "sources-config=../sources.json", "allow-insecure-loopback-upload=true", ""]))
         config.write_text("config-file=profiles/local.conf" + chr(10))
         cache = directory / "state/registrations"
@@ -101,12 +104,13 @@ def main():
             assert subscribed.wait(5)
             agent = launch()
             sim.storage.rmdir()  # Upload must recreate a deleted storage directory.
-            command = sim.make_command(sources=["business"])
+            command = sim.make_command(sources=["business", "sdk"])
             sim.send(command)
             result = sim.terminal(command.command_id)
             assert result.status == cloud.CMD_SUCCEEDED, result
             with tarfile.open(sim.verified[command.command_id]) as tar:
                 assert tar.extractfile("business/current.log").read() == expected
+                assert tar.extractfile("sdk/current.txt").read() == b"external source"
             print("PASS file-only startup and verified upload without business publisher")
             # Exercise the native parser using hand-written JSON, without protobuf encoding.
             from paho.mqtt.properties import Properties
@@ -163,15 +167,14 @@ def main():
             print("PASS JSON last will; profile selection resolves paths from selected config")
             valid = {"source_id": "x", "path": "logs/app"}
             invalid = [
-                json.dumps({"log_sources": [dict(valid, path="/etc")]}),
                 '{"log_sources":[]}', '{broken', '/* unclosed',
                 json.dumps({"log_sources": [valid, valid]})]
             for text in invalid:
                 sources.write_text(text)
                 result = subprocess.run([str(ROOT / "build/device-agent")],
                                         cwd=directory, capture_output=True, text=True, timeout=5)
-                assert result.returncode == 1 and "FATAL" in result.stdout, result
-            print("PASS outside-root, empty, malformed and duplicate source configurations fail startup")
+                assert result.returncode == 1 and "FATAL" in (result.stdout + result.stderr), result
+            print("PASS empty, malformed and duplicate source configurations fail startup")
         finally:
             for proc in reversed(processes):
                 stop(proc)

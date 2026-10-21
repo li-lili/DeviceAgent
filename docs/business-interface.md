@@ -34,9 +34,9 @@ log_sources:
 
 `business_id`、`source_id` 为 1～64 个字母、数字、点、横线或下划线，不能单独为 `.` / `..`。`source_id` 在设备内唯一，是云端 `collectLogs.sources` 使用的名称。云端需要预先约定或另行获取这些来源名称，本原型未扩展来源发现 API。
 
-`path` 为绝对文件路径或目录，必须位于 Agent 配置文件的 `allowed-root` 内。允许注册尚未创建的目录。Agent 读取时再次校验实际路径，忽略符号链接文件及符号链接子目录。业务必须给 Agent 运行用户目录遍历和文件读取权限；配置注册成功不代表稍后一定可读取。
+每个日志来源可单独配置绝对路径或相对路径，不再受统一 allowed-root 限制。相对路径以来源配置文件所在目录为基准。运行用户仍需要目录遍历、文件读取和 SELinux 权限；跳过符号链接。
 
-未配置 `file_patterns` 表示不过滤文件名，所以目录应只存日志；原型暂不解压 `.gz/.zst` 历史日志。`recursive` 默认 false。不需要 time_format、timezone 或级别配置。按天拉取要求文件名含合法 YYYY-MM-DD 日期，按北京时间解释；例如 2026-10-16.log。Agent 直接打包原始文件，不解析内容。
+未配置 `file_patterns` 表示不过滤文件名，所以目录应只存日志；原型暂不解压 `.gz/.zst` 历史日志。`recursive` 默认 false。不需要 time_format、timezone 或级别配置。按天拉取按 filename_date_formats 识别文件名中的合法日期，按北京时间解释；例如 2026-10-16.log。Agent 直接打包原始文件，不解析内容。
 
 ## 生命周期
 
@@ -56,3 +56,13 @@ log_sources:
 - 命令重复下发时返回已有状态，完成后返回原结果。
 - Agent 在执行任务期间重启，记录改为 `CMD_FAILED / AGENT_RESTARTED`；云端用新的命令编号重新发起。
 - 不维护全部遥测的磁盘缓存，不恢复中断上传，不删除业务原始日志。
+
+
+每个 `log_sources` 可配置 `filename_date_formats`，按顺序尝试识别文件名中的日期：
+
+```json
+"file_patterns": ["*.txt", "*.log"],
+"filename_date_formats": ["%Y-%m-%d.txt", "%Y%m%d.txt", "app_%d-%m-%Y.log"]
+```
+
+分别匹配 `2026-10-21.txt`、`20261021.txt`、`app_21-10-2026.log`，也支持文件名前缀。`%Y`、`%m`、`%d` 必须各出现一次，表示四位年、两位月、两位日；`%%` 表示字面百分号，其余字符按字面匹配。最多 16 个格式，每个最多 256 字节。省略或空数组默认识别 `%Y-%m-%d`。文件仍需匹配 `file_patterns`；日期按北京时间解释，无效日期跳过，最新文件模式仍按修改时间选择。修改配置后重启 Agent。

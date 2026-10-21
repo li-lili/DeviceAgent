@@ -79,7 +79,7 @@ def main():
         output = open(directory / f"agent-{len(processes)}.log", "w")
         handles.append(output)
         (directory / "device-agent.conf").write_text(chr(10).join([
-            f"port={port}", f"allowed-root={logs}", f"state-dir={directory / 'agent-state'}",
+            f"port={port}", "host=127.0.0.1", "device=demo-device", f"allowed-root={logs}", f"state-dir={directory / 'agent-state'}",
             f"work-dir={directory / 'work'}", "sources-config=", "allow-insecure-loopback-upload=true", ""]))
         proc = subprocess.Popen([str(ROOT / "build/device-agent")],
                                 stdout=output, stderr=subprocess.STDOUT, cwd=directory)
@@ -197,9 +197,9 @@ def main():
         bad = business.Registration()
         bad.CopyFrom(registration)
         bad.config_version = 2
-        bad.log_sources[0].path = "/etc"
+        bad.log_sources[0].path = "relative/path"
         assert not biz.register(bad).accepted
-        check("business cannot register a directory outside allowed root")
+        check("business MQTT registration requires an absolute path")
         # Restore retained declaration; then completely remove business presence.
         assert biz.register(registration).accepted
         biz.close()

@@ -1,0 +1,16 @@
+# 首次克隆后复制为 device-agent.cloud.conf，再填写实际信息。
+# device-agent.cloud.conf 已被 Git 忽略，请勿强制提交真实凭证。
+# 设备码，与云端设备一致。
+device=your-device-id
+# 云端提供的有效注册码；Agent 自动申请并缓存 Token。
+enrollment-key=your-enrollment-key
+
+host=emqx.test.humanuniverse.cn
+port=1883
+enroll-url=https://logserver.test.humanuniverse.cn/v1/enroll
+model=devicesim
+state-dir=run/cloud-agent
+work-dir=run/cloud-work
+sources-config=log-sources.json
+log-file=run/agent.log
+https-ca=ca-bundle.pem

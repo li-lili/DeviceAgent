@@ -1,0 +1,10 @@
+{
+  "name": "device-agent-android",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "openssl",
+    "protobuf",
+    { "name": "curl", "default-features": false, "features": ["openssl"] },
+    { "name": "libarchive", "default-features": false }
+  ]
+}

@@ -64,7 +64,7 @@ def main():
         def write_config(explicit="", url=None):
             config.write_text(chr(10).join([
                 f"host=127.0.0.1", f"port={port}", f"device={device}",
-                "allowed-root=logs", "state-dir=state", "work-dir=work", "model=test-model", "serial=TEST-123",
+                "log-file=run/agent.log", "state-dir=state", "work-dir=work", "model=test-model", "serial=TEST-123",
                 f"enroll-url={url or 'http://127.0.0.1:' + str(http.server_port) + '/v1/enroll'}",
                 f"enrollment-key={key}", "allow-insecure-loopback-enroll=true", f"token={explicit}", ""]))
 
@@ -137,7 +137,7 @@ def main():
             write_config()
             result = subprocess.run([str(ROOT / "build/device-agent")], cwd=directory,
                                     capture_output=True, text=True, timeout=5)
-            assert result.returncode == 1 and "invalid token file" in result.stdout
+            assert result.returncode == 1 and "invalid token file" in (result.stdout + result.stderr)
             assert len(requests) == 1
             token_file.unlink()
             for mode, expected in (("already_enrolled", "already_enrolled"),
@@ -146,17 +146,17 @@ def main():
                 reply_mode[0] = mode
                 result = subprocess.run([str(ROOT / "build/device-agent")], cwd=directory,
                                         capture_output=True, text=True, timeout=5)
-                assert result.returncode == 1 and expected in result.stdout, result
+                assert result.returncode == 1 and expected in (result.stdout + result.stderr), result
                 assert not token_file.exists()
                 assert not list(token_file.parent.glob("*.tmp.*"))
-                assert key not in result.stdout and token not in result.stdout
+                assert key not in (result.stdout + result.stderr) and token not in (result.stdout + result.stderr)
             print("PASS rejected enrollment and corrupt cache fail clearly without leaking credentials")
 
             count = len(requests)
             write_config(url="http://not-a-loopback.invalid/v1/enroll")
             result = subprocess.run([str(ROOT / "build/device-agent")], cwd=directory,
                                     capture_output=True, text=True, timeout=5)
-            assert result.returncode == 1 and "requires HTTPS" in result.stdout
+            assert result.returncode == 1 and "requires HTTPS" in (result.stdout + result.stderr)
             assert len(requests) == count
             assert key not in (directory / "run/agent.log").read_text()
             assert token not in (directory / "run/agent.log").read_text()
