@@ -1,0 +1,5 @@
+service logagent /data/vendor/logagent/device-agent
+    class main
+    user root
+    group root inet
+    seclabel u:r:vendor_init:s0
