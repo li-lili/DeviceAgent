@@ -42,8 +42,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="agent-minimal-profile-") as temp:
         directory = Path(temp)
         (directory / "device-agent.conf").write_text("environment=cloud" + chr(10))
+        # enrollment-key 已废弃（仅告警忽略）；注册配置由 enroll-url/private-key 决定，
+        # 该离线用例在损坏的 Token 缓存处失败，不会发起网络请求，也不会回显注册码。
         (directory / "device-agent.cloud.conf").write_text(
-            "device=offline-profile-test\nhost=127.0.0.1\nport=9\nmodel=test-model\nstate-dir=run/cloud-agent\nwork-dir=run/cloud-work\nsources-config=log-sources.json\nenrollment-key=enr_synthetic\n")
+            "device=offline-profile-test\nhost=127.0.0.1\nport=9\nmodel=test-model\nstate-dir=run/cloud-agent\nwork-dir=run/cloud-work\nsources-config=log-sources.json\nenroll-url=https://127.0.0.1/v1/enroll\nenrollment-key=enr_synthetic\n")
         cache = directory / "run/cloud-agent/tokens/offline-profile-test.token"
         cache.parent.mkdir(parents=True)
         cache.touch()

@@ -2,6 +2,8 @@
 
 C++17 日志采集程序，通过 MQTT 5 + JSON 接收云端命令，按文件名日期或最新文件规则选择业务日志，打包上传并回报结果。
 
+系统设计约定见 [日志系统顶层设计](docs/顶层设计.md)，第一条为日志大小、轮转与磁盘空间管理。
+
 完整操作见 [云端使用说明](docs/使用说明.md)，包含设备注册、配置、前台启动、日志采集、下载解压与排错。
 
 业务日志配置见 [业务端使用说明](docs/业务端使用说明.md)。
@@ -26,7 +28,7 @@ cmake --build build -j2
 cp -n device-agent.cloud.conf.example device-agent.cloud.conf
 ```
 
-在 `device-agent.cloud.conf` 中填写设备码和注册码，在 `device-agent.conf` 中设置 `environment=cloud`。然后编辑 `log-sources.json` 的业务日志目录和匹配规则，当前允许采集的根目录为项目下的 `business-logs/`。
+在 `device-agent.cloud.conf` 中填写设备码（即 SN）和设备私钥路径 `private-key`，在 `device-agent.conf` 中设置 `environment=cloud`。设备公钥需先由 PC 管理工具调用 `POST /v1/device-keys/bind` 绑定到云端，之后 Agent 用私钥对 `noetix-enroll-v1|SN` 做 RSA-PSS 签名换取 Token。然后编辑 `log-sources.json` 的业务日志目录和匹配规则，当前允许采集的根目录为项目下的 `business-logs/`。
 
 从项目根目录前台启动：
 

@@ -8,6 +8,8 @@
 #include <archive.h>
 #include <archive_entry.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
 #include <sys/stat.h>
 #include <fnmatch.h>
 #include <unistd.h>
@@ -144,9 +146,10 @@ static int64_t filename_day(const fs::path& path,const std::vector<FilenameDateF
 struct Options {
     std::string host, device, username, token, ca;
     std::string local_host, local_username, local_token, local_ca;
-    std::string enroll_url, enrollment_key, model, serial;
+    std::string enroll_url, model, serial;
     std::string https_ca; // 注册和对象存储上传使用的 PEM CA 证书包；与 MQTT ca 分开。
     fs::path token_file;
+    fs::path private_key; // 签名换 Token 的设备私钥 PEM，由产线/PC 工具写入，只读。
     int port=0;
     int local_port=0;
     fs::path state, work, sources_config, log_path;
@@ -200,7 +203,42 @@ static bool parse_cloud_json(const void* data,int length,google::protobuf::Messa
     return status.ok();
 }
 
-// Token 优先级与 Python 模拟器一致：配置 token → 已保存 token-file → 注册码换 Token。
+// Token 优先级与 Python 模拟器一致：配置 token → 已保存 token-file → 签名换 Token。
+// 设备私钥由产线/PC 工具流程预先写入安全存储，Agent 只读取，绝不生成或修改。
+static std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)> read_private_key(const fs::path& path) {
+    FILE* file=fopen(path.c_str(),"r");
+    if(!file)throw Failure("ENROLL_FAILED","cannot open private key: "+path.string());
+    EVP_PKEY* key=PEM_read_PrivateKey(file,nullptr,nullptr,nullptr);
+    fclose(file);
+    if(!key)throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+    return {key,&EVP_PKEY_free};
+}
+// 对 "noetix-enroll-v1|"+SN 做 RSA-PSS(SHA-256, MGF1-SHA256, salt=digest 长度 32 字节) 签名，
+// 再标准 Base64 单行编码。参数与服务端验签严格一致；salt 必须是 32 而不是 PSS 最大值。
+static std::string make_enroll_signature(const std::string& sn,EVP_PKEY* key) {
+    const std::string payload="noetix-enroll-v1|"+sn;
+    std::unique_ptr<EVP_MD_CTX,decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(),EVP_MD_CTX_free);
+    EVP_PKEY_CTX* params=nullptr;
+    if(!ctx||EVP_DigestSignInit(ctx.get(),&params,EVP_sha256(),nullptr,key)!=1)
+        throw Failure("ENROLL_FAILED","cannot initialize enrollment signature");
+    if(EVP_PKEY_CTX_set_rsa_padding(params,RSA_PKCS1_PSS_PADDING)!=1
+        ||EVP_PKEY_CTX_set_rsa_pss_saltlen(params,RSA_PSS_SALTLEN_DIGEST)!=1
+        ||EVP_PKEY_CTX_set_rsa_mgf1_md(params,EVP_sha256())!=1)
+        throw Failure("ENROLL_FAILED","cannot configure RSA-PSS parameters");
+    if(EVP_DigestSignUpdate(ctx.get(),payload.data(),payload.size())!=1)
+        throw Failure("ENROLL_FAILED","cannot hash enrollment payload");
+    size_t length=0;
+    if(EVP_DigestSignFinal(ctx.get(),nullptr,&length)!=1||!length)
+        throw Failure("ENROLL_FAILED","cannot size enrollment signature");
+    std::vector<unsigned char> bytes(length);
+    if(EVP_DigestSignFinal(ctx.get(),bytes.data(),&length)!=1)
+        throw Failure("ENROLL_FAILED","cannot sign enrollment payload");
+    // EVP_EncodeBlock 输出单行标准 Base64，不带换行；返回编码长度，不写结尾 NUL。
+    std::string signature((length+2)/3*4,'\0');
+    signature.resize(EVP_EncodeBlock(reinterpret_cast<unsigned char*>(signature.data()),
+        bytes.data(),static_cast<int>(length)));
+    return signature;
+}
 // 文件存在但为空或无法读取时明确失败，避免误把缓存损坏当成新设备而重复注册。
 static void resolve_token(Options& o) {
     auto valid_token=[](const std::string& token) {
@@ -212,7 +250,7 @@ static void resolve_token(Options& o) {
         if(o.username.empty())o.username=o.device;
         log("AUTH using configured device token");return;
     }
-    bool enrollment_configured=!o.enrollment_key.empty()||!o.enroll_url.empty();
+    bool enrollment_configured=!o.private_key.empty()||!o.enroll_url.empty();
     if(o.token_file.empty()&&!enrollment_configured)return; // 本地匿名 MQTT 无需注册。
     fs::path token_path=o.token_file.empty()?o.state/"tokens"/(o.device+".token"):o.token_file;
     if(fs::exists(token_path)) {
@@ -231,8 +269,8 @@ static void resolve_token(Options& o) {
         if(o.username.empty())o.username=o.device;
         log("AUTH loaded cached device token: "+token_path.string());return;
     }
-    if(o.enrollment_key.empty()||o.enroll_url.empty())
-        throw Failure("ENROLL_FAILED","token is missing; set enrollment-key and enroll-url");
+    if(o.private_key.empty()||o.enroll_url.empty())
+        throw Failure("ENROLL_FAILED","token is missing; set private-key and enroll-url");
     bool https=o.enroll_url.rfind("https://",0)==0;
     bool loopback=o.enroll_url.rfind("http://127.0.0.1:",0)==0||o.enroll_url.rfind("http://localhost:",0)==0;
     if(!https&&!(o.insecure_enroll&&loopback))
@@ -245,12 +283,13 @@ static void resolve_token(Options& o) {
     int fd=open(temporary.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
     if(fd<0)throw Failure("ENROLL_FAILED","cannot create token cache: "+token_path.string());
     try {
+        // 云端协议固定两字段：sn + 签名；不再携带 model、serial 等其他身份信息。
+        auto device_key=read_private_key(o.private_key);
+        std::string signature=make_enroll_signature(o.device,device_key.get());
         google::protobuf::Struct body;
         auto& fields=*body.mutable_fields();
-        fields["enrollment_key"].set_string_value(o.enrollment_key);
-        fields["device_id"].set_string_value(o.device);
-        fields["model"].set_string_value(o.model);
-        fields["serial"].set_string_value(o.serial);
+        fields["sn"].set_string_value(o.device);
+        fields["signature"].set_string_value(signature);
         std::string request=cloud_json(body),response;
         std::unique_ptr<CURL,decltype(&curl_easy_cleanup)> curl(curl_easy_init(),curl_easy_cleanup);
         if(!curl)throw Failure("ENROLL_FAILED","cannot initialize enrollment request");
@@ -284,22 +323,35 @@ static void resolve_token(Options& o) {
         google::protobuf::Struct reply;
         auto parsed=google::protobuf::util::JsonStringToMessage(response,&reply);
         if(status<200||status>=300) {
+            // 兼容扁平 {"error":"code"} 与嵌套 {"error":{"code":..}}；只输出已知码，不回显服务端正文。
             std::string code="request_failed";
             if(parsed.ok()) {
+                const std::set<std::string> known={"bad_request","unauthorized","sn_key_mismatch","rate_limited"};
                 auto error=reply.fields().find("error");
-                if(error!=reply.fields().end()&&error->second.kind_case()==google::protobuf::Value::kStructValue) {
-                    const auto& info=error->second.struct_value().fields();
-                    auto item=info.find("code");
-                    if(item!=info.end()) {
-                        // 只输出已知错误码，绝不将可能包含凭证的服务端正文写到日志。
-                        const std::set<std::string> known={"invalid_enrollment_key","not_allowed","already_enrolled","rate_limited"};
-                        if(known.count(item->second.string_value()))code=item->second.string_value();
+                if(error!=reply.fields().end()) {
+                    if(error->second.kind_case()==google::protobuf::Value::kStringValue
+                        &&known.count(error->second.string_value()))
+                        code=error->second.string_value();
+                    else if(error->second.kind_case()==google::protobuf::Value::kStructValue) {
+                        const auto& info=error->second.struct_value().fields();
+                        auto item=info.find("code");
+                        if(item!=info.end()&&item->second.kind_case()==google::protobuf::Value::kStringValue
+                            &&known.count(item->second.string_value()))
+                            code=item->second.string_value();
                     }
                 }
             }
-            std::string hint=code=="already_enrolled"?"; device already registered: recover its token or ask administrator to allow re-enrollment":"";
+            std::string hint=code=="sn_key_mismatch"
+                ?"; SN is bound to a different public key: rerun the PC-tool activation"
+                :code=="unauthorized"?"; check the device SN and private key, or bind the public key via the PC tool":"";
             throw Failure("ENROLL_FAILED","HTTP "+std::to_string(status)+" "+code+hint);
         }
+        // 云端返回的 device_id 应与配置的 SN 一致；不一致只告警，不改变本机主题和身份。
+        auto identity=reply.fields().find("device_id");
+        if(parsed.ok()&&identity!=reply.fields().end()
+            &&identity->second.kind_case()==google::protobuf::Value::kStringValue
+            &&identity->second.string_value()!=o.device)
+            log("ENROLL cloud device_id does not match configured device: "+identity->second.string_value(),LogLevel::Warning);
         auto token=reply.fields().find("token");
         if(!parsed.ok()||token==reply.fields().end()||token->second.kind_case()!=google::protobuf::Value::kStringValue
             ||!valid_token(token->second.string_value()))
@@ -834,6 +886,7 @@ static Options load_options(const fs::path& config,int depth=0,std::string envir
             else if(key=="port")o.port=port(false);
             else if(key=="device")o.device=value;
             else if(key=="allowed-root")log("CONFIG allowed-root is obsolete and ignored",LogLevel::Warning);
+            else if(key=="enrollment-key")log("CONFIG enrollment-key is obsolete and ignored",LogLevel::Warning);
             else if(key=="log-file")o.log_path=path_value(value);
             else if(key=="state-dir")o.state=path_value(value);
             else if(key=="work-dir")o.work=path_value(value);
@@ -842,7 +895,7 @@ static Options load_options(const fs::path& config,int depth=0,std::string envir
             else if(key=="token")o.token=value;
             else if(key=="token-file")o.token_file=path_value(value);
             else if(key=="enroll-url")o.enroll_url=value;
-            else if(key=="enrollment-key")o.enrollment_key=value;
+            else if(key=="private-key")o.private_key=path_value(value);
             else if(key=="model")o.model=value;
             else if(key=="serial")o.serial=value;
             else if(key=="allow-insecure-loopback-enroll") {
@@ -877,7 +930,6 @@ static Options load_options(const fs::path& config,int depth=0,std::string envir
     if(!identifier(o.device))throw std::runtime_error("invalid device in "+config.string());
     if(o.state.empty()||o.work.empty())throw std::runtime_error("state-dir and work-dir must not be empty");
     if(o.host.empty()||!o.port)throw std::runtime_error("host and port are required");
-    if(!o.enroll_url.empty()&&o.model.empty())throw std::runtime_error("model is required for enrollment");
     if(o.local_host.empty())o.local_host=o.host;
     return o;
 }

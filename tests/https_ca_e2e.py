@@ -47,7 +47,7 @@ def main():
         try:
             settings = (
                 "host=127.0.0.1\nport=9\ndevice=https-ca-test\nallowed-root=logs\n"
-                "sources-config=sources.json\nenrollment-key=synthetic-registration-key\n"
+                "sources-config=sources.json\nprivate-key=key.pem\n"
                 "model=test-model\nstate-dir=run/agent\nwork-dir=run/work\n"
                 f"enroll-url=https://127.0.0.1:{server.server_port}/v1/enroll\n"
             )
@@ -73,8 +73,9 @@ def main():
                     process.terminate()
                 output = process.communicate(timeout=10)[0]
             assert "ENROLL succeeded" in output, output
-            assert len(requests) == 1 and requests[0]["device_id"] == "https-ca-test"
-            assert token not in output and "synthetic-registration-key" not in output
+            assert len(requests) == 1 and requests[0]["sn"] == "https-ca-test"
+            assert set(requests[0].keys()) == {"sn", "signature"}
+            assert token not in output and requests[0]["signature"] not in output
 
             config.write_text(settings + "https-ca=missing-ca.pem\n")
             missing = subprocess.run([str(BINARY)], cwd=directory, capture_output=True, text=True, timeout=5)
