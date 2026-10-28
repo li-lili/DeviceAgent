@@ -22,7 +22,15 @@ if [[ ! -x "$VCPKG_ROOT/vcpkg" ]]; then
     echo "Set VCPKG_ROOT to a bootstrapped vcpkg checkout (revision $revision)" >&2
     exit 1
 fi
-build="$root/build/android-arm64"
+build=${DEVICE_AGENT_ANDROID_BUILD_DIR:-"$root/build/android-arm64"}
+package=${DEVICE_AGENT_ANDROID_PACKAGE_DIR:-"$root/out/android-arm64"}
+archive=${DEVICE_AGENT_ANDROID_ARCHIVE:-"$root/out/logagent-android12-arm64.tar.gz"}
+runtime=${DEVICE_AGENT_ANDROID_DATA_DIR:-/data/vendor/logagent}
+[[ "$runtime" == /* && "$runtime" != *";"* ]] || { echo "Android data directory must be an absolute path" >&2; exit 1; }
+if [[ -e "$package" || -e "$archive" ]]; then
+    echo "Refusing to overwrite an existing package; select new DEVICE_AGENT_ANDROID_PACKAGE_DIR and DEVICE_AGENT_ANDROID_ARCHIVE" >&2
+    exit 1
+fi
 installed="$build/vcpkg_installed"
 "$VCPKG_ROOT/vcpkg" install --triplet arm64-logagent --host-triplet x64-logagent-host \
     --x-manifest-root="$root/android" --x-install-root="$installed" \
@@ -35,9 +43,9 @@ cmake -S "$root" -B "$build" -DCMAKE_BUILD_TYPE=Release \
     -DVCPKG_MANIFEST_DIR="$root/android" -DVCPKG_INSTALLED_DIR="$installed" \
     -DVCPKG_MANIFEST_INSTALL=OFF -DANDROID_ABI=arm64-v8a \
     -DANDROID_PLATFORM=android-31 -DANDROID_STL=c++_static \
+    -DDEVICE_AGENT_ANDROID_DATA_DIR="$runtime" \
     -DDEVICE_AGENT_PROTOC="$installed/x64-logagent-host/tools/protobuf/protoc"
 cmake --build "$build" --target device-agent -j "$VCPKG_MAX_CONCURRENCY"
-package="$root/out/android-arm64"
 mkdir -p "$package/bin" "$package/config" "$package/init" "$package/sepolicy"
 install -m 0755 "$build/device-agent" "$package/bin/device-agent"
 "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" "$package/bin/device-agent"
@@ -66,15 +74,20 @@ mkdir -p "$package/licenses/android-ndk"
 for license in "$ANDROID_NDK_HOME/NOTICE" "$ANDROID_NDK_HOME/NOTICE.toolchain"; do
     [[ ! -f "$license" ]] || install -m 0644 "$license" "$package/licenses/android-ndk/"
 done
+# Package only reviewed public templates and documentation. Never collect run/state directories.
 install -m 0644 "$root/docs/Android部署说明.md" "$package/README.md"
-install -m 0644 "$root/docs/Android开机自启.md" "$package/Android开机自启.md"
-install -m 0644 "$root/docs/使用说明.md" "$package/使用说明.md"
-install -m 0644 "$root/docs/配置参数说明.md" "$package/配置参数说明.md"
-install -m 0644 "$root/docs/业务端使用说明.doc" "$package/业务端使用说明.doc"
-(cd "$package" && sha256sum bin/device-agent > SHA256SUMS)
-# 使用明确的文件清单，避免把用户另放到输出目录的真实凭证打进分发包。
-tar -czf "$root/out/logagent-android12-arm64.tar.gz" -C "$package" \
+for document in Android开机自启.md Android编译说明.md 配置参数说明.md; do
+    install -m 0644 "$root/docs/$document" "$package/$document"
+done
+printf '%s\n' "Android ABI: arm64-v8a" "Android API: 31" "Runtime directory: $runtime" > "$package/BUILD-INFO.txt"
+sha256sum "$root/src/main.cpp" | awk '{print "src/main.cpp SHA256: " $1}' >> "$package/BUILD-INFO.txt"
+(cd "$package" && sha256sum bin/device-agent config/device-agent.conf config/device-agent.cloud.conf.example config/log-sources.json config/ca-bundle.pem > SHA256SUMS)
+mkdir -p "$(dirname "$archive")"
+# Explicit allowlist: no private keys, Tokens or user-supplied deployment configuration.
+tar -czf "$archive" -C "$package" \
     bin/device-agent config/device-agent.conf config/device-agent.cloud.conf.example \
     config/log-sources.json config/ca-bundle.pem init/vendor.logagent.rc \
-    sepolicy/vendor_logagent.te sepolicy/file_contexts licenses README.md 使用说明.md Android开机自启.md 配置参数说明.md 业务端使用说明.doc SHA256SUMS
+    sepolicy/vendor_logagent.te sepolicy/file_contexts licenses README.md \
+    Android开机自启.md Android编译说明.md 配置参数说明.md BUILD-INFO.txt SHA256SUMS
 echo "Android arm64 package: $package"
+echo "Archive: $archive"

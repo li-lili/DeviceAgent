@@ -50,6 +50,16 @@ target_include_directories(device-agent PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(device-agent PRIVATE ${AGENT_LIBRARIES} OpenSSL::Crypto Threads::Threads)
 target_compile_options(device-agent PRIVATE -Wall -Wextra -Wpedantic)
 
+option(DEVICE_AGENT_BUILD_RESPONSE_TESTS "Build offline enrollment response tests" OFF)
+if(DEVICE_AGENT_BUILD_RESPONSE_TESTS)
+    enable_testing()
+    add_executable(enroll-response-tests tests/enroll_response_test.cpp)
+    target_include_directories(enroll-response-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(enroll-response-tests PRIVATE protobuf::libprotobuf)
+    target_compile_options(enroll-response-tests PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME enroll-response-offline COMMAND enroll-response-tests)
+endif()
+
 if(ANDROID)
     set(DEVICE_AGENT_ANDROID_DATA_DIR "/data/vendor/logagent" CACHE STRING "Android runtime directory")
     target_compile_definitions(device-agent PRIVATE

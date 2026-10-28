@@ -57,3 +57,5 @@ cp -n device-agent.cloud.conf.example device-agent.cloud.conf
 Android 12 ARM64 原生服务的构建与固件集成见 [Android 部署说明](docs/Android部署说明.md)。
 
 编译和打包命令见 [Android 编译说明](docs/Android编译说明.md)。
+
+enroll 的结构化脱敏日志、响应判定及离线验证见 [enroll 响应诊断](docs/enroll响应诊断.md)。

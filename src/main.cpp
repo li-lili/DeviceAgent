@@ -2,6 +2,7 @@
 #include "cloud.pb.h"
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/util/json_util.h>
+#include "enroll_response.h"
 #include <mosquitto.h>
 #include <mqtt_protocol.h>
 #include <curl/curl.h>
@@ -241,10 +242,7 @@ static std::string make_enroll_signature(const std::string& sn,EVP_PKEY* key) {
 }
 // 文件存在但为空或无法读取时明确失败，避免误把缓存损坏当成新设备而重复注册。
 static void resolve_token(Options& o) {
-    auto valid_token=[](const std::string& token) {
-        return !token.empty()&&token.size()<=65536
-            &&token.find_first_of(" \t\r\n")==std::string::npos&&token.find('\0')==std::string::npos;
-    };
+    auto valid_token=enrollment::valid_token;
     if(!o.token.empty()) {
         if(!valid_token(o.token))throw Failure("AUTH_FAILED","invalid configured token");
         if(o.username.empty())o.username=o.device;
@@ -319,41 +317,20 @@ static void resolve_token(Options& o) {
         log("ENROLL requesting device token for "+o.device);
         auto result=curl_easy_perform(curl.get());
         long status=0;curl_easy_getinfo(curl.get(),CURLINFO_RESPONSE_CODE,&status);
-        if(result!=CURLE_OK)throw Failure("ENROLL_FAILED","enrollment request failed: "+std::string(curl_easy_strerror(result)));
-        google::protobuf::Struct reply;
-        auto parsed=google::protobuf::util::JsonStringToMessage(response,&reply);
-        if(status<200||status>=300) {
-            // 兼容扁平 {"error":"code"} 与嵌套 {"error":{"code":..}}；只输出已知码，不回显服务端正文。
-            std::string code="request_failed";
-            if(parsed.ok()) {
-                const std::set<std::string> known={"bad_request","unauthorized","sn_key_mismatch","rate_limited"};
-                auto error=reply.fields().find("error");
-                if(error!=reply.fields().end()) {
-                    if(error->second.kind_case()==google::protobuf::Value::kStringValue
-                        &&known.count(error->second.string_value()))
-                        code=error->second.string_value();
-                    else if(error->second.kind_case()==google::protobuf::Value::kStructValue) {
-                        const auto& info=error->second.struct_value().fields();
-                        auto item=info.find("code");
-                        if(item!=info.end()&&item->second.kind_case()==google::protobuf::Value::kStringValue
-                            &&known.count(item->second.string_value()))
-                            code=item->second.string_value();
-                    }
-                }
-            }
-            std::string hint=code=="sn_key_mismatch"
-                ?"; SN is bound to a different public key: rerun the PC-tool activation"
-                :code=="unauthorized"?"; check the device SN and private key, or bind the public key via the PC tool":"";
-            throw Failure("ENROLL_FAILED","HTTP "+std::to_string(status)+" "+code+hint);
-        }
+        auto inspected=enrollment::inspect(status,response,signature,result==CURLE_OK);
+        if(result!=CURLE_OK)
+            throw Failure("ENROLL_FAILED","enrollment request failed: "+std::string(curl_easy_strerror(result))+"; ENROLL response "+inspected.diagnostic);
+        if(!inspected.success)throw Failure("ENROLL_FAILED","ENROLL response "+inspected.diagnostic);
+        log("ENROLL response "+inspected.diagnostic);
+        const auto& reply=inspected.data;
         // 云端返回的 device_id 应与配置的 SN 一致；不一致只告警，不改变本机主题和身份。
         auto identity=reply.fields().find("device_id");
-        if(parsed.ok()&&identity!=reply.fields().end()
+        if(identity!=reply.fields().end()
             &&identity->second.kind_case()==google::protobuf::Value::kStringValue
             &&identity->second.string_value()!=o.device)
-            log("ENROLL cloud device_id does not match configured device: "+identity->second.string_value(),LogLevel::Warning);
+            log("ENROLL cloud device_id does not match configured device; configured identity retained",LogLevel::Warning);
         auto token=reply.fields().find("token");
-        if(!parsed.ok()||token==reply.fields().end()||token->second.kind_case()!=google::protobuf::Value::kStringValue
+        if(token==reply.fields().end()||token->second.kind_case()!=google::protobuf::Value::kStringValue
             ||!valid_token(token->second.string_value()))
             throw Failure("ENROLL_FAILED","enrollment response has no valid device token");
         const auto& value=token->second.string_value();
