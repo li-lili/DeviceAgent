@@ -1,8 +1,8 @@
 """Real-process MQTT/JSON -> C++ Agent -> multipart HTTP -> archive assertions."""
-import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -25,11 +25,7 @@ def free_port():
 
 def read_bundle(path):
     with tarfile.open(path) as tar:
-        files = {m.name: tar.extractfile(m).read() for m in tar if m.isfile()}
-    manifest = json.loads(files.pop("manifest.json"))
-    for entry in manifest["files"]:
-        assert hashlib.sha256(files[entry["name"]]).hexdigest() == entry["sha256"]
-    return files, manifest
+        return {m.name: tar.extractfile(m).read() for m in tar if m.isfile()}
 
 
 def main():
@@ -46,21 +42,21 @@ def main():
     app_new = "2026-10-16 10:00:00.000[INFO]: NEWEST_APP\n"
     sdk = ("2026-10-15 23:59:59.999[ERROR]: SDK_ERROR\n"
            "2026-10-16 00:00:00.000[INFO]: NEWEST_SDK\n")
-    (logs / "app/app-2026-10-15.log").write_text(app_old)
-    (logs / "app/app-2026-10-16.log").write_text(app_new)
+    (logs / "app/2026_10_15_00_00_00.log").write_text(app_old)
+    (logs / "app/2026_10_16_10_00_00.log").write_text(app_new)
     (logs / "app/ignore.txt").write_text("not a configured log\n")
-    (logs / "sdk/nested/vendor-2026-10-15.log").write_text(sdk)
+    (logs / "sdk/nested/2026_10_15_23_59_59.log").write_text(sdk)
     (logs / "sdk/empty.log").touch()
-    os.utime(logs / "app/app-2026-10-15.log", (100, 100))
-    os.utime(logs / "app/app-2026-10-16.log", (200, 200))
+    os.utime(logs / "app/2026_10_15_00_00_00.log", (100, 100))
+    os.utime(logs / "app/2026_10_16_10_00_00.log", (200, 200))
     (logs / "app/escape.log").symlink_to("/etc/passwd")
     # No line-length limit and no text requirement: preserve all bytes.
     raw = b"x" * (1024 * 1024 + 1) + bytes([0, 255])
-    (logs / "app/raw-2026-10-15.log").write_bytes(raw)
-    for name in ("no-date.log", "invalid-2026-02-30.log"):
+    (logs / "app/2026_10_15_00_00_01.log").write_bytes(raw)
+    for name in ("no-date.log", "invalid-2026_02_30.log"):
         (logs / "app" / name).write_bytes(b"not selected by date")
         os.utime(logs / "app" / name, (1, 1))
-    os.utime(logs / "app/raw-2026-10-15.log", (2, 2))
+    os.utime(logs / "app/2026_10_15_00_00_01.log", (2, 2))
 
 
     port = free_port()
@@ -124,23 +120,24 @@ def main():
         sim.send(latest)
         result = sim.terminal(latest.command_id)
         assert result.status == cloud.CMD_SUCCEEDED, result
-        files, manifest = read_bundle(sim.verified[latest.command_id])
-        assert files == {"business/app-2026-10-16.log": app_new.encode(), "camera_sdk/nested/vendor-2026-10-15.log": sdk.encode()}, files
-        assert not manifest["truncated"]
+        files = read_bundle(sim.verified[latest.command_id])
+        assert files == {"business/2026_10_16_10_00_00.log": app_new.encode(), "camera_sdk/nested/2026_10_15_23_59_59.log": sdk.encode()}, files
+        assert not result.collect_logs.truncated
         check("latest: one complete file per source; recursive path; empty/pattern/symlink handling")
+        upload = sim.requests[latest.command_id]
+        assert re.fullmatch(r"log_demo-device_\d{8}_\d{6}\.tar\.gz", upload.filename), upload.filename
+        check("bundle and upload filename follow log_<sn>_<yyyyMMdd_HHmmss>.tar.gz without <>")
 
         days = sim.make_command("days", start="2026-10-15")
         sim.send(days)
         result = sim.terminal(days.command_id)
         assert result.status == cloud.CMD_SUCCEEDED, result
-        files, manifest = read_bundle(sim.verified[days.command_id])
+        files = read_bundle(sim.verified[days.command_id])
         assert files == {
-            "business/app-2026-10-15.log": app_old.encode(),
-            "business/raw-2026-10-15.log": raw,
-            "camera_sdk/nested/vendor-2026-10-15.log": sdk.encode(),
+            "business/2026_10_15_00_00_00.log": app_old.encode(),
+            "business/2026_10_15_00_00_01.log": raw,
+            "camera_sdk/nested/2026_10_15_23_59_59.log": sdk.encode(),
         }, files.keys()
-        assert manifest["selection_mode"] == "filename_date"
-        assert all("unparsed_lines" not in entry and "changed_during_read" not in entry for entry in manifest["files"])
         assert result.collect_logs.time_from_ns == days.collect_logs.time_from_ns
         assert result.collect_logs.time_to_ns == days.collect_logs.time_to_ns
         check("filename date selection preserves whole files, binary bytes and lines over 1 MiB")
@@ -221,7 +218,7 @@ def main():
         check("Agent restart: registry and command results recovered without live business or retained config")
 
         assert not sim.errors, sim.errors
-        assert (logs / "app/app-2026-10-15.log").read_text() == app_old
+        assert (logs / "app/2026_10_15_00_00_00.log").read_text() == app_old
         wait_for(lambda: not list((directory / "work").iterdir()), description="temporary bundle cleanup")
         check("cloud validates size/SHA256; source logs unchanged; temporary task files cleaned")
         report = {"status": "passed", "checks": checks, "artifacts": str(directory),

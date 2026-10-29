@@ -1,3 +1,4 @@
 /vendor/bin/device-agent                             u:object_r:vendor_logagent_exec:s0
 /data/vendor/logagent(/.*)?                          u:object_r:vendor_logagent_data_file:s0
-/data/vendor/logagent/business-logs(/.*)?             u:object_r:vendor_logagent_log_file:s0
+# <ANDROID_LOG_ROOT>=/data/log：业务、C++ SDK、嵌入式日志统一按只读日志标签处理。
+/data/log(/.*)?                                      u:object_r:vendor_logagent_log_file:s0

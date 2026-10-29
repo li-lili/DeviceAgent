@@ -1,21 +1,33 @@
 {
-  // 相对于 /data/vendor/logagent；与实际业务写入的目录保持一致。
+  // <ANDROID_LOG_ROOT>=/data/log，按 app、cpp-sdk、embedded 分目录，使用绝对路径。
+  // 与设备上业务写入目录保持一致；修改后重启 Agent 生效。
   "log_sources": [
     {
-      "source_id": "business",
-      "path": "business-logs/app",
+      // 业务日志，云端可用 app 指定此来源。
+      "source_id": "app",
+      "path": "/data/log/app",
       "recursive": true,
       "file_patterns": ["*.log", "*.txt"],
-      // %Y=四位年，%m=两位月，%d=两位日；可填写多个格式。
-      "filename_date_formats": ["%Y-%m-%d", "%Y%m%d"]
+      // %Y=四位年，%m=两位月，%d=两位日；只解析日期，文件名中的时分秒不影响选择。
+      "filename_date_formats": ["%Y_%m_%d"]
     },
     {
-      "source_id": "camera_sdk",
-      "path": "business-logs/sdk",
+      // C++ SDK 日志。
+      "source_id": "cpp_sdk",
+      "path": "/data/log/cpp-sdk",
       "recursive": true,
       "file_patterns": ["*.log", "*.txt"],
-      // %Y=四位年，%m=两位月，%d=两位日；可填写多个格式。
-      "filename_date_formats": ["%Y-%m-%d", "%Y%m%d"]
+      // %Y=四位年，%m=两位月，%d=两位日；只解析日期，文件名中的时分秒不影响选择。
+      "filename_date_formats": ["%Y_%m_%d"]
+    },
+    {
+      // 嵌入式日志。
+      "source_id": "embedded",
+      "path": "/data/log/embedded",
+      "recursive": true,
+      "file_patterns": ["*.log", "*.txt"],
+      // %Y=四位年，%m=两位月，%d=两位日；只解析日期，文件名中的时分秒不影响选择。
+      "filename_date_formats": ["%Y_%m_%d"]
     }
   ]
 }

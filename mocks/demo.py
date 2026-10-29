@@ -196,13 +196,10 @@ def main():
                     if not member.isfile():
                         continue
                     data = archive.extractfile(member).read()
-                    if member.name == "manifest.json":
-                        timeline.emit("云端查看包内清单", json.loads(data))
-                    else:
-                        text = data.decode("utf-8")
-                        if mode == "days" and "today" in text:
-                            raise AssertionError("day selection leaked today's records")
-                        timeline.emit("云端查看日志：" + member.name, text)
+                    text = data.decode("utf-8")
+                    if mode == "days" and "today" in text:
+                        raise AssertionError("day selection leaked today's records")
+                    timeline.emit("云端查看日志：" + member.name, text)
             wait_for(lambda: not list((directory / "work").iterdir()), description="task cleanup")
 
         if sim.errors:

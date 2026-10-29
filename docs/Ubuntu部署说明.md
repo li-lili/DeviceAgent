@@ -13,7 +13,7 @@ sha256sum -c SHA256SUMS
 cp -n device-agent.cloud.conf.example device-agent.cloud.conf
 ```
 
-编辑 `device-agent.cloud.conf`，填写云端设备 SN（`device`）、设备私钥路径（`private-key`）和设备型号（`model`）；服务地址使用云端提供的值。设备公钥需先由 PC 管理工具调用 `POST /v1/device-keys/bind` 绑定到云端，Agent 只用私钥签名换 Token。编辑 `log-sources.json`，填写业务日志目录、文件匹配规则及文件名日期格式。然后从部署目录运行：
+编辑 `device-agent.cloud.conf`，填写云端设备 SN（`device`）、设备私钥路径（`private-key`）和设备型号（`model`）；测试阶段也可用 `identity-dir` 指向含 `identity.json`（`sn`、`public_key`）与 `priv.pem` 的目录来替代这两项；服务地址使用云端提供的值。设备公钥需先由 PC 管理工具调用 `POST /v1/device-keys/bind` 绑定到云端，Agent 只用私钥签名换 Token。编辑 `log-sources.json`，填写业务日志目录、文件匹配规则及文件名日期格式。然后从部署目录运行：
 
 ```bash
 ./device-agent

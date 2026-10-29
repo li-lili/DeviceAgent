@@ -4,9 +4,6 @@ out/
 run/
 tmp/
 
-# 业务日志
-business-logs/
-
 # 编辑器本地配置与缓存
 .vs/
 .vscode/

@@ -1,31 +1,43 @@
 {
-  // 日志来源列表，修改后重启 Agent；业务文件直接进入压缩包，不解析文件内容。
-  // 按天拉取根据 filename_date_formats 识别文件名日期，例如 2026-10-16.log、app-2026-10-16.1.log。
+  // <ANDROID_LOG_ROOT>=/data/log，按 app、cpp-sdk、embedded 分目录，使用绝对路径。
+  // 按天拉取根据 filename_date_formats 识别文件名日期，例如 2026_10_21_09_05_03.log。
   // 文件名日期按北京时间解释；最新文件模式无需日期，按修改时间选择。
   "log_sources": [
     {
-      // 来源唯一标识，云端可用 today business 指定此来源。
-      "source_id": "business",
-      // 业务日志目录，相对于本文件所在目录，支持绝对路径，各来源可位于不同目录。
-      "path": "business-logs/app",
+      // 业务日志，云端可用 app 指定此来源。
+      "source_id": "app",
+      // 业务日志目录；支持绝对路径，各来源可位于不同目录。
+      "path": "/data/log/app",
       // 是否扫描子目录。
       "recursive": true,
       // 文件名匹配规则；可配置多个。
       "file_patterns": ["*.log", "*.txt"],
-      // %Y=四位年，%m=两位月，%d=两位日；可填写多个格式。
-      "filename_date_formats": ["%Y-%m-%d", "%Y%m%d"]
+      // %Y=四位年，%m=两位月，%d=两位日；只解析日期，文件名中的时分秒不影响选择。
+      "filename_date_formats": ["%Y_%m_%d"]
     },
     {
-      // 摄像头 SDK 日志来源。
-      "source_id": "camera_sdk",
+      // C++ SDK 日志。
+      "source_id": "cpp_sdk",
       // SDK 日志目录。
-      "path": "business-logs/sdk",
+      "path": "/data/log/cpp-sdk",
       // 是否扫描子目录。
       "recursive": true,
       // 仅采集 .log 文件。
       "file_patterns": ["*.log", "*.txt"],
-      // %Y=四位年，%m=两位月，%d=两位日；可填写多个格式。
-      "filename_date_formats": ["%Y-%m-%d", "%Y%m%d"]
+      // %Y=四位年，%m=两位月，%d=两位日；只解析日期，文件名中的时分秒不影响选择。
+      "filename_date_formats": ["%Y_%m_%d"]
+    },
+    {
+      // 嵌入式日志。
+      "source_id": "embedded",
+      // 嵌入式模块日志目录。
+      "path": "/data/log/embedded",
+      // 是否扫描子目录。
+      "recursive": true,
+      // 仅采集 .log 文件。
+      "file_patterns": ["*.log", "*.txt"],
+      // %Y=四位年，%m=两位月，%d=两位日；只解析日期，文件名中的时分秒不影响选择。
+      "filename_date_formats": ["%Y_%m_%d"]
     }
   ]
 }

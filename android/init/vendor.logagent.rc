@@ -4,5 +4,13 @@ service vendor.logagent /vendor/bin/device-agent
     disabled
     restart_period 10
 
+# <ANDROID_LOG_ROOT>=/data/log：创建来源目录，由 file_contexts 打上日志标签。
+# 业务写入进程需与 Agent 同组（system），否则自行调整权限或单独授权。
+on post-fs-data
+    mkdir /data/log 0771 system system
+    mkdir /data/log/app 0771 system system
+    mkdir /data/log/cpp-sdk 0771 system system
+    mkdir /data/log/embedded 0771 system system
+
 on property:sys.boot_completed=1
     start vendor.logagent

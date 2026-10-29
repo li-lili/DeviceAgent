@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -212,6 +213,48 @@ def main():
                 serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
             print("PASS corrupt private key fails without creating a token cache")
 
+            # identity-dir：sn 与公钥来自 identity.json，私钥取同目录 priv.pem，无需 device/private-key。
+            identity_dir = directory / "identity"
+            identity_dir.mkdir()
+            (identity_dir / "priv.pem").write_bytes(private_path.read_bytes())
+            identity_config = chr(10).join([
+                "host=127.0.0.1", f"port={port}", "log-file=run/agent.log", "state-dir=state",
+                "work-dir=work", "model=test-model", "serial=TEST-123",
+                f"enroll-url=http://127.0.0.1:{http.server_port}/v1/enroll",
+                "allow-insecure-loopback-enroll=true", f"identity-dir={identity_dir}", ""])
+            (identity_dir / "identity.json").write_text(json.dumps(
+                {"sn": "identity-dir-device", "public_key": public_pem.decode()}))
+            (directory / "device-agent.conf").write_text(identity_config)
+            identity_token = directory / "state/tokens/identity-dir-device.token"
+            before = len(requests)
+            # 该身份未在 broker 注册，MQTT 不会 READY，因此以 Token 缓存出现作为 enroll 成功的判据。
+            process = subprocess.Popen([str(ROOT / "build/device-agent")], cwd=directory,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                deadline = time.monotonic() + 5
+                while process.poll() is None and not identity_token.exists() and time.monotonic() < deadline:
+                    time.sleep(.02)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                process.communicate(timeout=5)
+            assert len(requests) == before + 1 and requests[-1][1]["sn"] == "identity-dir-device"
+            assert identity_token.read_text() == token
+            assert stat.S_IMODE(identity_token.stat().st_mode) == 0o600
+            print("PASS identity-dir supplies sn and matching key pair without device/private-key")
+
+            other_public = rsa.generate_private_key(public_exponent=65537, key_size=2048).public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+            identity_token.unlink()
+            (identity_dir / "identity.json").write_text(json.dumps(
+                {"sn": "identity-dir-device", "public_key": other_public.decode()}))
+            before = len(requests)
+            code, out = attempt()
+            assert code == 1 and "does not match identity public_key" in out, out
+            assert len(requests) == before and not identity_token.exists()
+            print("PASS mismatched identity public key fails before any network call")
+
+            identity_token.unlink(missing_ok=True)
             before = len(requests)
             write_config(url="http://not-a-loopback.invalid/v1/enroll")
             code, out = attempt()

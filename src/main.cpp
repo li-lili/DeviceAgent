@@ -16,11 +16,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cerrno>
+#include <cctype>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -47,6 +49,9 @@ namespace biz = deviceagent::business::v1;
 using Clock = std::chrono::system_clock;
 // 主线程、MQTT 网络线程和工作线程共享退出标志；Ctrl+C / SIGTERM 只设置标志。
 static std::atomic<bool> stopping{false};
+// hello 与 inventory 展示用的版本串：Agent 版本固定，整机固件暂用占位值。
+static constexpr const char* kAgentVersion="0.1.0";
+static constexpr const char* kFirmwareVersion="1.0.0";
 static int64_t now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(); }
 static std::ofstream log_file;
 static std::mutex log_mutex;
@@ -86,7 +91,7 @@ static void save_pb(const fs::path& path, const google::protobuf::Message& msg) 
     { std::ofstream f(tmp, std::ios::binary); if (!msg.SerializeToOstream(&f)) throw Failure("DISK_FULL", "cannot save " + tmp.string()); f.flush(); if (!f) throw Failure("DISK_FULL", "write failed"); }
     fs::rename(tmp, path);
 }
-// 分块计算文件摘要，用于包内清单和上传校验，避免将整个文件读入内存。
+// 分块计算文件摘要，用于上传校验，避免将整个文件读入内存。
 static std::string sha256(const fs::path& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw Failure("READ_FAILED", "cannot hash file");
@@ -143,6 +148,11 @@ static int64_t filename_day(const fs::path& path,const std::vector<FilenameDateF
     }
     return -1;
 }
+// 采集包名里的 SN 部分：只取 SN 中 "BJ" 起（含 BJ）的后缀，找不到时使用完整 SN。
+static std::string bundle_sn(const std::string& sn) {
+    auto at=sn.find("BJ");
+    return at==std::string::npos?sn:sn.substr(at);
+}
 // 启动设置由默认值和配置文件确定。sources_config 非空时直接从文件加载来源。
 struct Options {
     std::string host, device, username, token, ca;
@@ -151,6 +161,7 @@ struct Options {
     std::string https_ca; // 注册和对象存储上传使用的 PEM CA 证书包；与 MQTT ca 分开。
     fs::path token_file;
     fs::path private_key; // 签名换 Token 的设备私钥 PEM，由产线/PC 工具写入，只读。
+    fs::path identity_dir; // 测试阶段的固定身份目录：identity.json + priv.pem，只读。
     int port=0;
     int local_port=0;
     fs::path state, work, sources_config, log_path;
@@ -239,6 +250,48 @@ static std::string make_enroll_signature(const std::string& sn,EVP_PKEY* key) {
     signature.resize(EVP_EncodeBlock(reinterpret_cast<unsigned char*>(signature.data()),
         bytes.data(),static_cast<int>(length)));
     return signature;
+}
+// 测试阶段身份固定在 identity-dir：identity.json 提供 sn 与 public_key（同一份文件可直接导入 PC 管理工具），
+// priv.pem 提供私钥。只读取校验，不生成、不写回。
+static void load_identity(Options& o) {
+    if(o.identity_dir.empty())return;
+    fs::path manifest=o.identity_dir/"identity.json";
+    std::ifstream input(manifest,std::ios::binary);
+    if(!input)throw Failure("IDENTITY_FAILED","cannot read identity: "+manifest.string());
+    std::string text;
+    char buffer[65536];
+    while(input.read(buffer,sizeof buffer)||input.gcount()) {
+        text.append(buffer,static_cast<size_t>(input.gcount()));
+        if(text.size()>65536)throw Failure("IDENTITY_FAILED","identity file is too large: "+manifest.string());
+    }
+    if(input.bad())throw Failure("IDENTITY_FAILED","cannot read identity: "+manifest.string());
+    google::protobuf::Struct parsed;
+    if(!google::protobuf::util::JsonStringToMessage(text,&parsed).ok())
+        throw Failure("IDENTITY_FAILED","invalid identity JSON: "+manifest.string());
+    const auto& fields=parsed.fields();
+    auto string_field=[&](const char* name)->const std::string* {
+        auto item=fields.find(name);
+        return item!=fields.end()&&item->second.kind_case()==google::protobuf::Value::kStringValue
+            &&!item->second.string_value().empty()?&item->second.string_value():nullptr;
+    };
+    auto sn=string_field("sn"),public_key=string_field("public_key");
+    if(!sn||!identifier(*sn))throw Failure("IDENTITY_FAILED","identity.json has no valid sn: "+manifest.string());
+    if(!public_key)throw Failure("IDENTITY_FAILED","identity.json has no public_key: "+manifest.string());
+    // sn 是唯一的身份来源；同时配置 device 时只允许完全一致，避免主题、缓存与密钥错配。
+    if(!o.device.empty()&&o.device!=*sn)
+        throw Failure("IDENTITY_FAILED","device conflicts with identity sn: "+o.device+" != "+*sn);
+    o.device=*sn;
+    if(o.private_key.empty())o.private_key=o.identity_dir/"priv.pem";
+    // 私钥必须与身份文件里的公钥配对，否则云端必然验签失败，且失败原因在端侧难以区分。
+    auto private_key=read_private_key(o.private_key);
+    BIO* bio=BIO_new_mem_buf(public_key->data(),static_cast<int>(public_key->size()));
+    if(!bio)throw Failure("IDENTITY_FAILED","cannot read identity public_key");
+    std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)> pub(
+        PEM_read_bio_PUBKEY(bio,nullptr,nullptr,nullptr),&EVP_PKEY_free);
+    BIO_free(bio);
+    if(!pub||EVP_PKEY_eq(private_key.get(),pub.get())!=1)
+        throw Failure("IDENTITY_FAILED","private key does not match identity public_key: "+o.private_key.string());
+    log("IDENTITY loaded sn="+o.device+" from "+manifest.string());
 }
 // 文件存在但为空或无法读取时明确失败，避免误把缓存损坏当成新设备而重复注册。
 static void resolve_token(Options& o) {
@@ -354,11 +407,11 @@ static void resolve_token(Options& o) {
         throw;
     }
 }
-// 原始文件直接进入压缩包；hash 在写入 tar 时计算，和包内实际字节一致。
+// 原始文件直接进入压缩包，不读入内存、不解释内容。
 struct File {
     biz::LogSource source;
     fs::path path;
-    std::string name, hash;
+    std::string name;
     uint64_t size=0;
     int64_t mtime=0;
 };
@@ -484,6 +537,10 @@ class Agent {
             log("REGISTER "+owner+" sources="+std::to_string(r.log_sources_size()));
         }catch(const std::exception& e){ack.set_message(e.what());}
         publish(local+owner+"/down/register_ack",ack);
+        // 来源增删后整表重发 inventory，控制台模块列表才能随注册立即更新。
+        bool started=false;
+        {std::lock_guard<std::mutex> lock(mutex);started=ready;}
+        if(started&&ack.accepted())publish_inventory();
     }
     // MQTT 收到命令后只做校验和入队，耗时的文件与 HTTP 操作交给 worker。
     void command(const void* data,int len) {
@@ -504,6 +561,23 @@ class Agent {
         // 先落盘 ACCEPTED，再唤醒工作线程；收到命令不等于任务已成功。
         active=c.command_id();result(active,cloud_pb::CMD_ACCEPTED);pending=c;cv.notify_all();
     }
+    // 软件清单整表：Agent 自身加每个已注册日志来源，全部 kind=service，
+    // 控制台「采集日志」下拉直接取这些名称；来源协议没有版本字段，版本记为 unknown。
+    void publish_inventory() {
+        cloud_pb::Inventory inv;inv.set_model(opts.model);inv.set_serial(opts.serial);inv.set_device_id(opts.device);inv.set_boot_id(boot);inv.set_os("Linux");
+        inv.mutable_time()->set_wall_ns(now_ns());
+        inv.mutable_time()->set_mono_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        auto* agent=inv.add_software();agent->set_name("device-agent");agent->set_version(kAgentVersion);agent->set_kind("service");
+        std::set<std::string> seen{"device-agent"};
+        {std::lock_guard<std::mutex> lock(mutex);
+         for(auto& [owner,r]:registrations)for(auto& s:r.log_sources())
+             if(identifier(s.source_id())&&seen.insert(s.source_id()).second) {
+                 auto* module=inv.add_software();module->set_name(s.source_id());module->set_version("unknown");module->set_kind("service");
+             }}
+        publish(up+"inventory",inv);
+        log("INVENTORY published modules="+std::to_string(inv.software_size()));
+    }
     // 消息分发：业务注册、hello_reply、采集命令、上传凭证。
     // 收到 hello_reply 后上报 inventory 并标记 ready，允许接收采集任务。
     void on_message(const mosquitto_message* m) {
@@ -515,9 +589,7 @@ class Agent {
         if(topic==down+"hello_reply") {
             log("HELLO_REPLY received");
             cloud_pb::HelloReply reply;if(!parse_cloud_json(m->payload,m->payloadlen,reply))return;
-            cloud_pb::Inventory inv;inv.set_model(opts.model);inv.set_serial(opts.serial);inv.set_device_id(opts.device);inv.set_boot_id(boot);inv.set_os("Linux");inv.mutable_time()->set_wall_ns(now_ns());
-            auto* sw=inv.add_software();sw->set_name("device-agent");sw->set_version("0.1.0");sw->set_kind("service");
-            publish(up+"inventory",inv);
+            publish_inventory();
             {std::lock_guard<std::mutex> lock(mutex);ready=true;}
             log("READY hello handshake complete");
         } else if(topic==down+"cmd") {
@@ -547,7 +619,10 @@ class Agent {
         log("MQTT cloud subscription confirmed; sending hello, waiting for hello_reply");
         // 仅在云端下行订阅确认后发布 presence/hello。
         cloud_pb::Presence p;p.set_online(true);p.set_boot_id(boot);p.set_sent_wall_ns(now_ns());publish(up+"presence",p);
-        cloud_pb::Hello h;h.set_model(opts.model);h.set_device_id(opts.device);h.set_boot_id(boot);h.set_protocol_version("1");h.set_sent_wall_ns(now_ns());publish(up+"hello",h);
+        cloud_pb::Hello h;h.set_model(opts.model);h.set_device_id(opts.device);h.set_boot_id(boot);h.set_protocol_version("1");h.set_sent_wall_ns(now_ns());
+        // 设备列表的整机版本列取自这里；分模块清单以 inventory.software 为准。
+        h.set_firmware_version(kFirmwareVersion);h.set_software_version(std::string("device-agent/")+kAgentVersion);
+        publish(up+"hello",h);
     }
     // 把来源 ID 映射为来源配置；不指定则选全部，找不到返回 UNKNOWN_SOURCE。
     std::vector<biz::LogSource> sources(const cloud_pb::CollectLogsArgs& args) {
@@ -570,7 +645,7 @@ class Agent {
             std::vector<File> local_files;
             std::vector<FilenameDateFormat> formats;
             for(const auto& format:source.filename_date_formats())formats.emplace_back(format);
-            if(formats.empty())formats.emplace_back("%Y-%m-%d");
+            if(formats.empty())formats.emplace_back("%Y_%m_%d");
             auto add=[&](const fs::directory_entry& entry) {
                 if(entry.is_symlink()||!entry.is_regular_file())return;
                 auto path=fs::canonical(entry.path());if(!inside(path,root))return;
@@ -602,23 +677,29 @@ class Agent {
         // 所有候选按修改时间从旧到新排序，便于包超限时优先去掉较旧整份文件。
         std::sort(files.begin(),files.end(),[](auto& a,auto& b){return a.mtime<b.mtime;});return files;
     }
+    // 采集包统一命名 log_<sn>_<打包时间>.tar.gz；sn 取 BJ 起后缀，打包时间取北京时间 yyyyMMdd_HHmmss。
+    // 尖括号只是占位符，实际文件名不含 <>，避免云端存储或 Windows 下载时被替换。
+    // 同一任务因包超限重新打包时保持该时间和文件名不变。
+    static std::string bundle_stamp(int64_t ns) {
+        std::time_t seconds=static_cast<std::time_t>(ns/1000000000LL)+8*3600;
+        std::tm tm{};if(!gmtime_r(&seconds,&tm))throw Failure("PACK_FAILED","cannot format bundle time");
+        char text[32]{};if(std::strftime(text,sizeof text,"%Y%m%d_%H%M%S",&tm)==0)throw Failure("PACK_FAILED","cannot format bundle time");
+        return text;
+    }
     // 原文件直接分块写入 tar.gz，不创建日志副本，不读取或解释日志行。
     // 读取范围固定为扫描时的大小，防止业务持续追加导致任务无法结束。
     fs::path bundle(const cloud_pb::Command& cmd,const fs::path& dir,std::vector<File>& files,bool& truncated) {
-        fs::path target=dir/"logs.tar.gz";
+        fs::path target=dir/("log_"+bundle_sn(opts.device)+"_"+bundle_stamp(now_ns())+".tar.gz");
         uint64_t limit=cmd.collect_logs().max_bundle_bytes()?cmd.collect_logs().max_bundle_bytes():500ULL*1024*1024;
         for(;;) {
             if(files.empty())throw Failure("BUNDLE_TOO_SMALL","no whole file fits bundle size limit");
             archive* a=archive_write_new();archive_write_add_filter_gzip(a);archive_write_set_format_pax_restricted(a);
             if(archive_write_open_filename(a,target.c_str())!=ARCHIVE_OK){std::string msg=archive_error_string(a);archive_write_free(a);throw Failure("DISK_FULL",msg);}
             try {
-                // 摘要与 tar 使用同一批字节，避免提前计算摘要后业务又改写文件导致摘要不一致。
+                // 直接写入原文件字节；整包摘要打包完成后单独计算，包内不再生成清单。
                 auto append=[&](const std::string& name,const fs::path& path,uint64_t size) {
                     std::ifstream in(path,std::ios::binary);
                     if(!in)throw Failure("READ_FAILED","cannot open "+path.string());
-                    std::unique_ptr<EVP_MD_CTX,decltype(&EVP_MD_CTX_free)> digest(EVP_MD_CTX_new(),EVP_MD_CTX_free);
-                    if(!digest||EVP_DigestInit_ex(digest.get(),EVP_sha256(),nullptr)!=1)
-                        throw std::runtime_error("digest initialization failed");
                     archive_entry* entry=archive_entry_new();archive_entry_set_pathname(entry,name.c_str());
                     archive_entry_set_size(entry,size);archive_entry_set_filetype(entry,AE_IFREG);archive_entry_set_perm(entry,0600);
                     int rc=archive_write_header(a,entry);archive_entry_free(entry);
@@ -630,35 +711,11 @@ class Agent {
                         in.read(data,count);
                         if(in.gcount()!=count)throw Failure("READ_FAILED","file shrank or read failed: "+path.string());
                         if(archive_write_data(a,data,count)!=count)throw Failure("PACK_FAILED","archive write failed");
-                        if(EVP_DigestUpdate(digest.get(),data,static_cast<size_t>(count))!=1)
-                            throw std::runtime_error("digest update failed");
                         size-=static_cast<uint64_t>(count);
                     }
-                    unsigned char bytes[EVP_MAX_MD_SIZE];unsigned int length=0;
-                    if(EVP_DigestFinal_ex(digest.get(),bytes,&length)!=1)throw std::runtime_error("digest finalization failed");
-                    std::ostringstream hex;
-                    for(unsigned int i=0;i<length;++i)hex<<std::hex<<std::setw(2)<<std::setfill('0')<<static_cast<int>(bytes[i]);
-                    return hex.str();
                 };
-                for(auto& f:files)f.hash=append(f.name,f.path,f.size);
+                for(auto& f:files)append(f.name,f.path,f.size);
 
-                // 文件写完后才生成清单，确保清单摘要对应刚刚写入压缩包的原始内容。
-                google::protobuf::Struct manifest;auto& fields=*manifest.mutable_fields();
-                fields["device_id"].set_string_value(opts.device);fields["command_id"].set_string_value(cmd.command_id());
-                fields["selection_mode"].set_string_value(cmd.collect_logs().selection_mode()==cloud_pb::LATEST_FILE?"latest_file":"filename_date");
-                fields["requested_from_ns"].set_string_value(std::to_string(cmd.collect_logs().time_from_ns()));
-                fields["requested_to_ns"].set_string_value(std::to_string(cmd.collect_logs().time_to_ns()));
-                fields["truncated"].set_bool_value(truncated);fields["agent_version"].set_string_value("0.1.0");
-                auto* list=fields["files"].mutable_list_value();
-                for(const auto& f:files) {
-                    auto& meta=*list->add_values()->mutable_struct_value()->mutable_fields();
-                    meta["source_id"].set_string_value(f.source.source_id());meta["name"].set_string_value(f.name);
-                    meta["sha256"].set_string_value(f.hash);meta["size_bytes"].set_string_value(std::to_string(f.size));
-                    meta["mtime_ns"].set_string_value(std::to_string(f.mtime));
-                }
-                std::string json;google::protobuf::util::MessageToJsonString(manifest,&json);
-                {std::ofstream out(dir/"manifest.json");out<<json;if(!out)throw Failure("DISK_FULL","cannot write manifest");}
-                append("manifest.json",dir/"manifest.json",fs::file_size(dir/"manifest.json"));
                 if(archive_write_close(a)!=ARCHIVE_OK)throw Failure("PACK_FAILED","archive close failed");
                 archive_write_free(a);
             }catch(...){archive_write_free(a);throw;}
@@ -873,6 +930,7 @@ static Options load_options(const fs::path& config,int depth=0,std::string envir
             else if(key=="token-file")o.token_file=path_value(value);
             else if(key=="enroll-url")o.enroll_url=value;
             else if(key=="private-key")o.private_key=path_value(value);
+            else if(key=="identity-dir")o.identity_dir=path_value(value);
             else if(key=="model")o.model=value;
             else if(key=="serial")o.serial=value;
             else if(key=="allow-insecure-loopback-enroll") {
@@ -904,6 +962,7 @@ static Options load_options(const fs::path& config,int depth=0,std::string envir
         return load_options(base/("device-agent."+environment+".conf"),depth+1,environment);
     }
     log("CONFIG profile="+fs::absolute(config).string()+" environment="+environment+" cloud-wire=json");
+    load_identity(o);
     if(!identifier(o.device))throw std::runtime_error("invalid device in "+config.string());
     if(o.state.empty()||o.work.empty())throw std::runtime_error("state-dir and work-dir must not be empty");
     if(o.host.empty()||!o.port)throw std::runtime_error("host and port are required");

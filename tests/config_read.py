@@ -54,7 +54,6 @@ def main():
         assert result.returncode == 1 and "invalid token file" in (result.stdout + result.stderr), result
         assert str(cache) in (result.stdout + result.stderr) and "environment=cloud" in (result.stdout + result.stderr)
         assert "enr_synthetic" not in (result.stdout + result.stderr)
-        assert not (directory / "business-logs").exists()
 
         (directory / "device-agent.cloud.conf").write_text("enrollment-key=enr_synthetic" + chr(10))
         result = subprocess.run([str(ROOT / "build/device-agent")], cwd=directory,

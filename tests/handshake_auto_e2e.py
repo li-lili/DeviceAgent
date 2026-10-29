@@ -76,7 +76,9 @@ def main():
 
             content = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
             content += "[INFO]: automatic collection after handshake" + chr(10)
-            (logs / (datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d") + ".log")).write_text(content)
+            # 受管日志统一命名 yyyy_MM_dd_HH_mm_ss.log；日期部分用于按天筛选。
+            stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y_%m_%d_%H_%M_%S")
+            (logs / (stamp + ".log")).write_text(content)
             for index in (2, 3):
                 agent = start([str(ROOT / "build/device-agent")], f"agent-{index}.log")
                 wait_for(lambda: output.read_text().count("Verified log bundle:") == index - 1,
@@ -88,7 +90,7 @@ def main():
             assert len(bundles) == 2
             for bundle in bundles:
                 with tarfile.open(bundle) as tar:
-                    assert tar.extractfile("business/" + datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d") + ".log").read() == content.encode()
+                    assert tar.extractfile("business/" + stamp + ".log").read() == content.encode()
             print("PASS every completed handshake triggers exactly one new verified daily log bundle")
 
             # Keep this Agent alive, then request another bundle through the same CLI.

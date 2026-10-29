@@ -28,7 +28,7 @@ cmake --build build -j2
 cp -n device-agent.cloud.conf.example device-agent.cloud.conf
 ```
 
-在 `device-agent.cloud.conf` 中填写设备码（即 SN）和设备私钥路径 `private-key`，在 `device-agent.conf` 中设置 `environment=cloud`。设备公钥需先由 PC 管理工具调用 `POST /v1/device-keys/bind` 绑定到云端，之后 Agent 用私钥对 `noetix-enroll-v1|SN` 做 RSA-PSS 签名换取 Token。然后编辑 `log-sources.json` 的业务日志目录和匹配规则，当前允许采集的根目录为项目下的 `business-logs/`。
+在 `device-agent.cloud.conf` 中填写设备码（即 SN）和设备私钥路径 `private-key`；测试阶段可改用 `identity-dir` 指向含 `identity.json`（`sn`、`public_key`）与 `priv.pem` 的目录，此时无需再写 `device`、`private-key`，在 `device-agent.conf` 中设置 `environment=cloud`。设备公钥需先由 PC 管理工具调用 `POST /v1/device-keys/bind` 绑定到云端，之后 Agent 用私钥对 `noetix-enroll-v1|SN` 做 RSA-PSS 签名换取 Token。然后编辑 `log-sources.json` 的业务日志目录和匹配规则，采集根目录为 `<ANDROID_LOG_ROOT>=/data/log`，下分 `app/`、`cpp-sdk/`、`embedded/` 三个来源目录。
 
 从项目根目录前台启动：
 
