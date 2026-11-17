@@ -1,6 +1,7 @@
 # 编译产物与临时文件
 build/
 out/
+dist/
 run/
 tmp/
 

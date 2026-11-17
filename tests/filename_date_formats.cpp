@@ -23,6 +23,13 @@ int main() {
         assert(filename_day(name,unified)==expected);
     for(const auto* name:{"20261021_09_05_03.log","2026_10_2_09_05_03.log","2026_10_32_09_05_03.log"})
         assert(filename_day(name,unified)==-1);
+    // 设备实际命名 yyyyMMdd_HHmmss_来源.log：%Y%m%d 只取日期部分。
+    std::vector<FilenameDateFormat> compact{FilenameDateFormat("%Y%m%d")};
+    assert(filename_day("20260605_234038_app.log",compact)==filename_day("2026-06-05.txt",defaults));
+    for(const auto* name:{"20261021_000000_cpp-sdk.log","20261021_235959_embedded.txt"})
+        assert(filename_day(name,compact)==expected);
+    for(const auto* name:{"20260230_000000_app.log","20261301_000000_app.log","2026102_000000_app.log"})
+        assert(filename_day(name,compact)==-1);
     std::vector<FilenameDateFormat> percent{FilenameDateFormat("%Y%m%d%%.txt")};
     assert(filename_day("20261021%.txt",percent)==expected);
     for(const auto* format:{"","%Y%m","%Y%Y%m%d","%y%m%d","%Y%m%d%"}) {

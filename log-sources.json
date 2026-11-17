@@ -1,20 +1,8 @@
 {
-  // <ANDROID_LOG_ROOT>=/data/log，按 app、cpp-sdk、embedded 分目录，使用绝对路径。
-  // 按天拉取根据 filename_date_formats 识别文件名日期，例如 2026_10_21_09_05_03.log。
+  // <ANDROID_LOG_ROOT>=/data/log，按 cpp-sdk、embedded、android 分目录，使用绝对路径。
+  // 按天拉取根据 filename_date_formats 识别文件名日期，例如 20260605_234038_sdk.log 或 2026_10_21_09_05_03.log。
   // 文件名日期按北京时间解释；最新文件模式无需日期，按修改时间选择。
   "log_sources": [
-    {
-      // 业务日志，云端可用 app 指定此来源。
-      "source_id": "app",
-      // 业务日志目录；支持绝对路径，各来源可位于不同目录。
-      "path": "/data/log/app",
-      // 是否扫描子目录。
-      "recursive": true,
-      // 文件名匹配规则；可配置多个。
-      "file_patterns": ["*.log", "*.txt"],
-      // %Y=四位年，%m=两位月，%d=两位日；只解析日期，文件名中的时分秒不影响选择。
-      "filename_date_formats": ["%Y_%m_%d"]
-    },
     {
       // C++ SDK 日志。
       "source_id": "cpp_sdk",
@@ -25,7 +13,8 @@
       // 仅采集 .log 文件。
       "file_patterns": ["*.log", "*.txt"],
       // %Y=四位年，%m=两位月，%d=两位日；只解析日期，文件名中的时分秒不影响选择。
-      "filename_date_formats": ["%Y_%m_%d"]
+      // 同时兼容 20260605_234038_app.log（%Y%m%d）与 2026_10_21_09_05_03.log（%Y_%m_%d）。
+      "filename_date_formats": ["%Y%m%d", "%Y_%m_%d"]
     },
     {
       // 嵌入式日志。
@@ -37,7 +26,20 @@
       // 仅采集 .log 文件。
       "file_patterns": ["*.log", "*.txt"],
       // %Y=四位年，%m=两位月，%d=两位日；只解析日期，文件名中的时分秒不影响选择。
-      "filename_date_formats": ["%Y_%m_%d"]
+      // 同时兼容 20260605_234038_app.log（%Y%m%d）与 2026_10_21_09_05_03.log（%Y_%m_%d）。
+      "filename_date_formats": ["%Y%m%d", "%Y_%m_%d"]
+    },
+    {
+      // 系统侧日志（logcat 与 kernel），与业务日志分目录存放。
+      "source_id": "android-logcat",
+      // 系统日志目录，例如 20260605_234038_logcat.013.log、20260605_234038_kernel.cur.log。
+      "path": "/data/log/android",
+      // 不扫描 tombstones 等子目录。
+      "recursive": false,
+      // 仅采集 .log 文件；.kernel_seq、.logcat_seq、*.id 不匹配。
+      "file_patterns": ["*.log"],
+      // 文件名日期为连续的 yyyyMMdd。
+      "filename_date_formats": ["%Y%m%d"]
     }
   ]
 }

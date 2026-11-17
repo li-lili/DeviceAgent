@@ -11,6 +11,10 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
+#include <openssl/bn.h>
+#include <openssl/core_names.h>
+#include <openssl/param_build.h>
+#include <iterator>
 #include <sys/stat.h>
 #include <fnmatch.h>
 #include <unistd.h>
@@ -161,7 +165,7 @@ struct Options {
     std::string https_ca; // 注册和对象存储上传使用的 PEM CA 证书包；与 MQTT ca 分开。
     fs::path token_file;
     fs::path private_key; // 签名换 Token 的设备私钥 PEM，由产线/PC 工具写入，只读。
-    fs::path identity_dir; // 测试阶段的固定身份目录：identity.json + priv.pem，只读。
+    fs::path device_file; // 只含 SN 的文件；SN 不写明文，读取后填入 device。
     int port=0;
     int local_port=0;
     fs::path state, work, sources_config, log_path;
@@ -215,16 +219,139 @@ static bool parse_cloud_json(const void* data,int length,google::protobuf::Messa
     return status.ok();
 }
 
+// 产线设备上的私钥是 OpenSSH 新格式（-----BEGIN OPENSSH PRIVATE KEY-----），
+// OpenSSL 的 PEM 接口读不了，这里按 openssh-key-v1 结构自行解析（仅无口令、RSA）。
+struct SshReader {
+    const unsigned char* data;
+    size_t size;
+    size_t pos=0;
+    bool u32(uint32_t& value) {
+        if(pos+4>size)return false;
+        value=(static_cast<uint32_t>(data[pos])<<24)|(static_cast<uint32_t>(data[pos+1])<<16)
+            |(static_cast<uint32_t>(data[pos+2])<<8)|static_cast<uint32_t>(data[pos+3]);
+        pos+=4;
+        return true;
+    }
+    bool bytes(const unsigned char*& out,size_t& length) {
+        uint32_t count=0;
+        if(!u32(count)||pos+count>size)return false;
+        out=data+pos;
+        length=count;
+        pos+=count;
+        return true;
+    }
+    bool text(std::string& out) {
+        const unsigned char* raw=nullptr;
+        size_t length=0;
+        if(!bytes(raw,length))return false;
+        out.assign(reinterpret_cast<const char*>(raw),length);
+        return true;
+    }
+};
+// 去掉 PEM 头尾并拼接 Base64；返回解码后的二进制。
+static std::string decode_openssh_base64(const std::string& text,const fs::path& path) {
+    const std::string begin="-----BEGIN OPENSSH PRIVATE KEY-----";
+    const std::string end="-----END OPENSSH PRIVATE KEY-----";
+    auto start=text.find(begin);
+    auto stop=text.find(end);
+    if(start==std::string::npos||stop==std::string::npos||stop<start)
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+    std::string body;
+    for(char c:text.substr(start+begin.size(),stop-start-begin.size()))
+        if(!std::isspace(static_cast<unsigned char>(c)))body.push_back(c);
+    if(body.empty()||body.size()%4)throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+    std::string blob(body.size()/4*3,'\0');
+    int decoded=EVP_DecodeBlock(reinterpret_cast<unsigned char*>(blob.data()),
+        reinterpret_cast<const unsigned char*>(body.data()),static_cast<int>(body.size()));
+    if(decoded<0)throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+    size_t padding=0;
+    while(padding<body.size()&&body[body.size()-1-padding]=='=')++padding;
+    blob.resize(static_cast<size_t>(decoded)-padding);
+    return blob;
+}
+static EVP_PKEY* read_openssh_private_key(const std::string& text,const fs::path& path) {
+    const std::string blob=decode_openssh_base64(text,path);
+    const std::string magic("openssh-key-v1\0",15);
+    if(blob.size()<magic.size()||blob.compare(0,magic.size(),magic)!=0)
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+    SshReader head{reinterpret_cast<const unsigned char*>(blob.data()),blob.size(),magic.size()};
+    std::string cipher,kdf,kdf_options;
+    if(!head.text(cipher)||!head.text(kdf)||!head.text(kdf_options))
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+    if(cipher!="none"||kdf!="none")
+        throw Failure("ENROLL_FAILED","encrypted OpenSSH private key is not supported: "+path.string());
+    uint32_t count=0;
+    const unsigned char* raw=nullptr;
+    size_t length=0;
+    if(!head.u32(count)||count!=1||!head.bytes(raw,length)||!head.bytes(raw,length))
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+    SshReader body{raw,length};
+    uint32_t check1=0,check2=0;
+    std::string kind;
+    if(!body.u32(check1)||!body.u32(check2)||check1!=check2||!body.text(kind))
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+    if(kind!="ssh-rsa")
+        throw Failure("ENROLL_FAILED","unsupported OpenSSH key type "+kind+": "+path.string());
+    // OpenSSH 的 RSA 私钥字段顺序：n、e、d、iqmp、p、q。
+    const unsigned char* fields[6]={};
+    size_t sizes[6]={};
+    for(int i=0;i<6;++i)
+        if(!body.bytes(fields[i],sizes[i]))
+            throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+    std::unique_ptr<BIGNUM,decltype(&BN_free)> n(BN_bin2bn(fields[0],sizes[0],nullptr),BN_free);
+    std::unique_ptr<BIGNUM,decltype(&BN_free)> e(BN_bin2bn(fields[1],sizes[1],nullptr),BN_free);
+    std::unique_ptr<BIGNUM,decltype(&BN_free)> d(BN_bin2bn(fields[2],sizes[2],nullptr),BN_free);
+    std::unique_ptr<BIGNUM,decltype(&BN_free)> iqmp(BN_bin2bn(fields[3],sizes[3],nullptr),BN_free);
+    std::unique_ptr<BIGNUM,decltype(&BN_free)> p(BN_bin2bn(fields[4],sizes[4],nullptr),BN_free);
+    std::unique_ptr<BIGNUM,decltype(&BN_free)> q(BN_bin2bn(fields[5],sizes[5],nullptr),BN_free);
+    std::unique_ptr<BN_CTX,decltype(&BN_CTX_free)> ctx(BN_CTX_new(),BN_CTX_free);
+    std::unique_ptr<BIGNUM,decltype(&BN_free)> dmp1(BN_new(),BN_free);
+    std::unique_ptr<BIGNUM,decltype(&BN_free)> dmq1(BN_new(),BN_free);
+    std::unique_ptr<BIGNUM,decltype(&BN_free)> pm1(BN_dup(p.get()),BN_free);
+    std::unique_ptr<BIGNUM,decltype(&BN_free)> qm1(BN_dup(q.get()),BN_free);
+    // 文件只存 d、p、q、iqmp，CRT 指数按 d mod (p-1)、d mod (q-1) 现算。
+    if(!n||!e||!d||!iqmp||!p||!q||!ctx||!dmp1||!dmq1||!pm1||!qm1
+        ||!BN_sub_word(pm1.get(),1)||!BN_sub_word(qm1.get(),1)
+        ||!BN_mod(dmp1.get(),d.get(),pm1.get(),ctx.get())
+        ||!BN_mod(dmq1.get(),d.get(),qm1.get(),ctx.get()))
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+    std::unique_ptr<OSSL_PARAM_BLD,decltype(&OSSL_PARAM_BLD_free)> builder(OSSL_PARAM_BLD_new(),OSSL_PARAM_BLD_free);
+    if(!builder
+        ||!OSSL_PARAM_BLD_push_BN(builder.get(),OSSL_PKEY_PARAM_RSA_N,n.get())
+        ||!OSSL_PARAM_BLD_push_BN(builder.get(),OSSL_PKEY_PARAM_RSA_E,e.get())
+        ||!OSSL_PARAM_BLD_push_BN(builder.get(),OSSL_PKEY_PARAM_RSA_D,d.get())
+        ||!OSSL_PARAM_BLD_push_BN(builder.get(),OSSL_PKEY_PARAM_RSA_FACTOR1,p.get())
+        ||!OSSL_PARAM_BLD_push_BN(builder.get(),OSSL_PKEY_PARAM_RSA_FACTOR2,q.get())
+        ||!OSSL_PARAM_BLD_push_BN(builder.get(),OSSL_PKEY_PARAM_RSA_EXPONENT1,dmp1.get())
+        ||!OSSL_PARAM_BLD_push_BN(builder.get(),OSSL_PKEY_PARAM_RSA_EXPONENT2,dmq1.get())
+        ||!OSSL_PARAM_BLD_push_BN(builder.get(),OSSL_PKEY_PARAM_RSA_COEFFICIENT1,iqmp.get()))
+        throw Failure("ENROLL_FAILED","cannot build private key: "+path.string());
+    std::unique_ptr<OSSL_PARAM,decltype(&OSSL_PARAM_free)> params(OSSL_PARAM_BLD_to_param(builder.get()),OSSL_PARAM_free);
+    std::unique_ptr<EVP_PKEY_CTX,decltype(&EVP_PKEY_CTX_free)> key_ctx(
+        EVP_PKEY_CTX_new_from_name(nullptr,"RSA",nullptr),EVP_PKEY_CTX_free);
+    EVP_PKEY* key=nullptr;
+    if(!params||!key_ctx||EVP_PKEY_fromdata_init(key_ctx.get())<=0
+        ||EVP_PKEY_fromdata(key_ctx.get(),&key,EVP_PKEY_KEYPAIR,params.get())<=0)
+        throw Failure("ENROLL_FAILED","cannot build private key: "+path.string());
+    return key;
+}
 // Token 优先级与 Python 模拟器一致：配置 token → 已保存 token-file → 签名换 Token。
 // 设备私钥由产线/PC 工具流程预先写入安全存储，Agent 只读取，绝不生成或修改。
+// 先按 PEM（PKCS#8 / PKCS#1）解析，失败再按 OpenSSH 格式解析，兼容产线 device_rsa。
 static std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)> read_private_key(const fs::path& path) {
     FILE* file=fopen(path.c_str(),"r");
     if(!file)throw Failure("ENROLL_FAILED","cannot open private key: "+path.string());
     EVP_PKEY* key=PEM_read_PrivateKey(file,nullptr,nullptr,nullptr);
     fclose(file);
-    if(!key)throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
-    return {key,&EVP_PKEY_free};
+    if(key)return {key,&EVP_PKEY_free};
+    std::ifstream input(path,std::ios::binary);
+    if(!input)throw Failure("ENROLL_FAILED","cannot open private key: "+path.string());
+    std::string text((std::istreambuf_iterator<char>(input)),std::istreambuf_iterator<char>());
+    if(text.find("-----BEGIN OPENSSH PRIVATE KEY-----")==std::string::npos)
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+    return {read_openssh_private_key(text,path),&EVP_PKEY_free};
 }
+
 // 对 "noetix-enroll-v1|"+SN 做 RSA-PSS(SHA-256, MGF1-SHA256, salt=digest 长度 32 字节) 签名，
 // 再标准 Base64 单行编码。参数与服务端验签严格一致；salt 必须是 32 而不是 PSS 最大值。
 static std::string make_enroll_signature(const std::string& sn,EVP_PKEY* key) {
@@ -251,47 +378,25 @@ static std::string make_enroll_signature(const std::string& sn,EVP_PKEY* key) {
         bytes.data(),static_cast<int>(length)));
     return signature;
 }
-// 测试阶段身份固定在 identity-dir：identity.json 提供 sn 与 public_key（同一份文件可直接导入 PC 管理工具），
-// priv.pem 提供私钥。只读取校验，不生成、不写回。
-static void load_identity(Options& o) {
-    if(o.identity_dir.empty())return;
-    fs::path manifest=o.identity_dir/"identity.json";
-    std::ifstream input(manifest,std::ios::binary);
-    if(!input)throw Failure("IDENTITY_FAILED","cannot read identity: "+manifest.string());
-    std::string text;
-    char buffer[65536];
+// SN 不写明文：device-file 指向只含 SN 的文本文件，去掉首尾空白后作为设备标识。
+// 同时写了 device 时只允许完全一致，避免主题、Token 缓存与密钥错配。
+static void load_device(Options& o) {
+    if(o.device_file.empty())return;
+    std::ifstream input(o.device_file,std::ios::binary);
+    if(!input)throw std::runtime_error("cannot read device-file: "+o.device_file.string());
+    std::string sn;
+    char buffer[256];
     while(input.read(buffer,sizeof buffer)||input.gcount()) {
-        text.append(buffer,static_cast<size_t>(input.gcount()));
-        if(text.size()>65536)throw Failure("IDENTITY_FAILED","identity file is too large: "+manifest.string());
+        sn.append(buffer,static_cast<size_t>(input.gcount()));
+        if(sn.size()>1024)throw std::runtime_error("device-file is too large: "+o.device_file.string());
     }
-    if(input.bad())throw Failure("IDENTITY_FAILED","cannot read identity: "+manifest.string());
-    google::protobuf::Struct parsed;
-    if(!google::protobuf::util::JsonStringToMessage(text,&parsed).ok())
-        throw Failure("IDENTITY_FAILED","invalid identity JSON: "+manifest.string());
-    const auto& fields=parsed.fields();
-    auto string_field=[&](const char* name)->const std::string* {
-        auto item=fields.find(name);
-        return item!=fields.end()&&item->second.kind_case()==google::protobuf::Value::kStringValue
-            &&!item->second.string_value().empty()?&item->second.string_value():nullptr;
-    };
-    auto sn=string_field("sn"),public_key=string_field("public_key");
-    if(!sn||!identifier(*sn))throw Failure("IDENTITY_FAILED","identity.json has no valid sn: "+manifest.string());
-    if(!public_key)throw Failure("IDENTITY_FAILED","identity.json has no public_key: "+manifest.string());
-    // sn 是唯一的身份来源；同时配置 device 时只允许完全一致，避免主题、缓存与密钥错配。
-    if(!o.device.empty()&&o.device!=*sn)
-        throw Failure("IDENTITY_FAILED","device conflicts with identity sn: "+o.device+" != "+*sn);
-    o.device=*sn;
-    if(o.private_key.empty())o.private_key=o.identity_dir/"priv.pem";
-    // 私钥必须与身份文件里的公钥配对，否则云端必然验签失败，且失败原因在端侧难以区分。
-    auto private_key=read_private_key(o.private_key);
-    BIO* bio=BIO_new_mem_buf(public_key->data(),static_cast<int>(public_key->size()));
-    if(!bio)throw Failure("IDENTITY_FAILED","cannot read identity public_key");
-    std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)> pub(
-        PEM_read_bio_PUBKEY(bio,nullptr,nullptr,nullptr),&EVP_PKEY_free);
-    BIO_free(bio);
-    if(!pub||EVP_PKEY_eq(private_key.get(),pub.get())!=1)
-        throw Failure("IDENTITY_FAILED","private key does not match identity public_key: "+o.private_key.string());
-    log("IDENTITY loaded sn="+o.device+" from "+manifest.string());
+    if(input.bad())throw std::runtime_error("cannot read device-file: "+o.device_file.string());
+    auto first=sn.find_first_not_of(" \t\r\n"),last=sn.find_last_not_of(" \t\r\n");
+    sn=first==std::string::npos?std::string():sn.substr(first,last-first+1);
+    if(!identifier(sn))throw std::runtime_error("device-file has no valid sn: "+o.device_file.string());
+    if(!o.device.empty()&&o.device!=sn)
+        throw std::runtime_error("device conflicts with device-file sn: "+o.device+" != "+sn);
+    o.device=sn;
 }
 // 文件存在但为空或无法读取时明确失败，避免误把缓存损坏当成新设备而重复注册。
 static void resolve_token(Options& o) {
@@ -561,15 +666,14 @@ class Agent {
         // 先落盘 ACCEPTED，再唤醒工作线程；收到命令不等于任务已成功。
         active=c.command_id();result(active,cloud_pb::CMD_ACCEPTED);pending=c;cv.notify_all();
     }
-    // 软件清单整表：Agent 自身加每个已注册日志来源，全部 kind=service，
+    // 软件清单整表：只列已注册日志来源，全部 kind=service，
     // 控制台「采集日志」下拉直接取这些名称；来源协议没有版本字段，版本记为 unknown。
     void publish_inventory() {
         cloud_pb::Inventory inv;inv.set_model(opts.model);inv.set_serial(opts.serial);inv.set_device_id(opts.device);inv.set_boot_id(boot);inv.set_os("Linux");
         inv.mutable_time()->set_wall_ns(now_ns());
         inv.mutable_time()->set_mono_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
-        auto* agent=inv.add_software();agent->set_name("device-agent");agent->set_version(kAgentVersion);agent->set_kind("service");
-        std::set<std::string> seen{"device-agent"};
+        std::set<std::string> seen;
         {std::lock_guard<std::mutex> lock(mutex);
          for(auto& [owner,r]:registrations)for(auto& s:r.log_sources())
              if(identifier(s.source_id())&&seen.insert(s.source_id()).second) {
@@ -919,6 +1023,7 @@ static Options load_options(const fs::path& config,int depth=0,std::string envir
             if(key=="host")o.host=value;
             else if(key=="port")o.port=port(false);
             else if(key=="device")o.device=value;
+            else if(key=="device-file")o.device_file=path_value(value);
             else if(key=="allowed-root")log("CONFIG allowed-root is obsolete and ignored",LogLevel::Warning);
             else if(key=="enrollment-key")log("CONFIG enrollment-key is obsolete and ignored",LogLevel::Warning);
             else if(key=="log-file")o.log_path=path_value(value);
@@ -930,7 +1035,6 @@ static Options load_options(const fs::path& config,int depth=0,std::string envir
             else if(key=="token-file")o.token_file=path_value(value);
             else if(key=="enroll-url")o.enroll_url=value;
             else if(key=="private-key")o.private_key=path_value(value);
-            else if(key=="identity-dir")o.identity_dir=path_value(value);
             else if(key=="model")o.model=value;
             else if(key=="serial")o.serial=value;
             else if(key=="allow-insecure-loopback-enroll") {
@@ -962,7 +1066,7 @@ static Options load_options(const fs::path& config,int depth=0,std::string envir
         return load_options(base/("device-agent."+environment+".conf"),depth+1,environment);
     }
     log("CONFIG profile="+fs::absolute(config).string()+" environment="+environment+" cloud-wire=json");
-    load_identity(o);
+    load_device(o);
     if(!identifier(o.device))throw std::runtime_error("invalid device in "+config.string());
     if(o.state.empty()||o.work.empty())throw std::runtime_error("state-dir and work-dir must not be empty");
     if(o.host.empty()||!o.port)throw std::runtime_error("host and port are required");

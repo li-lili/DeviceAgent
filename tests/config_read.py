@@ -37,6 +37,34 @@ def main():
                                     cwd=directory, capture_output=True, text=True, timeout=5)
             assert result.returncode == 1 and error in (result.stdout + result.stderr), result
 
+    # SN 不写明文：device-file 指向只含 SN 的文件；读取成功后 Token 缓存路径使用该 SN。
+    with tempfile.TemporaryDirectory(prefix="agent-device-file-") as temp:
+        directory = Path(temp)
+        baseline = "host=127.0.0.1\nport=9\nstate-dir=state\nwork-dir=work\n"
+        sn_file = directory / "sn.txt"
+        config = directory / "device-agent.conf"
+        sn_file.write_text("file-only-device\n")
+        config.write_text(baseline + "device-file=sn.txt\nenroll-url=https://127.0.0.1/v1/enroll\n")
+        token = directory / "state/tokens/file-only-device.token"
+        token.parent.mkdir(parents=True)
+        token.touch()
+        result = subprocess.run([str(ROOT / "build/device-agent")], cwd=directory,
+                                capture_output=True, text=True, timeout=5)
+        out = result.stdout + result.stderr
+        assert result.returncode == 1 and "invalid token file" in out and "file-only-device.token" in out, out
+
+        config.write_text(baseline + "device=other-device\ndevice-file=sn.txt\n")
+        result = subprocess.run([str(ROOT / "build/device-agent")], cwd=directory,
+                                capture_output=True, text=True, timeout=5)
+        assert result.returncode == 1 and "device conflicts with device-file sn" in (result.stdout + result.stderr), result
+
+        sn_file.write_text("bad sn!\n")
+        config.write_text(baseline + "device-file=sn.txt\n")
+        result = subprocess.run([str(ROOT / "build/device-agent")], cwd=directory,
+                                capture_output=True, text=True, timeout=5)
+        assert result.returncode == 1 and "device-file has no valid sn" in (result.stdout + result.stderr), result
+    print("PASS device-file supplies sn without plaintext device settings")
+
     # Minimal cloud profile applies built-in paths. A corrupt local cache stops
     # before any real registration or MQTT traffic, so this check is offline.
     with tempfile.TemporaryDirectory(prefix="agent-minimal-profile-") as temp:
