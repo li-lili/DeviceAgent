@@ -28,7 +28,12 @@ cmake --build build -j2
 cp -n device-agent.cloud.conf.example device-agent.cloud.conf
 ```
 
-在 `device-agent.cloud.conf` 中用 `device-file` 指定只含 SN 的文件、用 `private-key` 指定私钥路径，配置里不写 SN 明文；在 `device-agent.conf` 中设置 `environment=cloud`。设备公钥需先由 PC 管理工具调用 `POST /v1/device-keys/bind` 绑定到云端，之后 Agent 用私钥对 `noetix-enroll-v1|SN` 做 RSA-PSS 签名换取 Token。然后编辑 `log-sources.json` 的业务日志目录和匹配规则，采集根目录为 `<ANDROID_LOG_ROOT>=/data/log`，下分 `app/`、`cpp-sdk/`、`embedded/` 三个来源目录。
+在 `device-agent.cloud.conf` 中配置设备身份，配置里不写 SN 明文；在 `device-agent.conf` 中设置 `environment=cloud`。身份来源两种（`identity-source`）：
+
+- `file`（缺省）：`device-file` 指定只含 SN 的文件、`private-key` 指定私钥路径。
+- `vendor-storage`（RK3588 Ubuntu 板端推荐）：经 `libfactory_service.so` 直接读 Vendor Storage 的 SN 与私钥，私钥仅驻留内存；SN 缓存到 `state-dir/sn.cache`，token 有效时启动不读裸 eMMC 设备；库加载失败自动回退 file 来源。
+
+设备公钥需先由 PC 管理工具调用 `POST /v1/device-keys/bind` 绑定到云端，之后 Agent 用私钥对 `noetix-enroll-v1|SN` 做 RSA-PSS 签名换取 Token。然后编辑 `log-sources.json` 的业务日志目录和匹配规则，采集根目录为 `<ANDROID_LOG_ROOT>=/data/log`，下分 `cpp-sdk/`、`embedded/`、`android/` 来源目录。
 
 从项目根目录前台启动：
 

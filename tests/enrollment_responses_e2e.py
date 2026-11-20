@@ -3,7 +3,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
-import socket
 import stat
 import subprocess
 import tempfile
@@ -11,7 +10,7 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = Path(os.environ.get("DEVICE_AGENT_TEST_BINARY", ROOT / "build-native/device-agent"))
+BINARY = Path(os.environ.get("DEVICE_AGENT_TEST_BINARY", ROOT / "build/device-agent"))
 
 
 def require(value, label):
@@ -58,10 +57,9 @@ def main():
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        # A bound, non-listening socket prevents unrelated MQTT access in success tests.
-        with socket.socket() as mqtt_closed:
-            mqtt_closed.bind(("127.0.0.1", 0))
-            port = mqtt_closed.getsockname()[1]
+        # Reuse this local listener for the TCP readiness check; no real broker access.
+        with server:
+            port = server.server_port
             cases = [(200, {"token": token, "message": "accepted"}, True, None),
                      (201, {"token": token, "message": "created"}, True, None),
                      (400, {"error": {"code": "bad_request"}}, False, "bad_request"),

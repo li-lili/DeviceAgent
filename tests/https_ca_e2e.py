@@ -46,7 +46,7 @@ def main():
         thread.start()
         try:
             settings = (
-                "host=127.0.0.1\nport=9\ndevice=https-ca-test\nallowed-root=logs\n"
+                f"host=127.0.0.1\nport={server.server_port}\ndevice=https-ca-test\nallowed-root=logs\n"
                 "sources-config=sources.json\nprivate-key=key.pem\n"
                 "model=test-model\nstate-dir=run/agent\nwork-dir=run/work\n"
                 f"enroll-url=https://127.0.0.1:{server.server_port}/v1/enroll\n"

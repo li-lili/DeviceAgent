@@ -45,9 +45,9 @@ else()
     set(AGENT_LIBRARIES protobuf::libprotobuf PkgConfig::MQTT PkgConfig::CURL PkgConfig::ARCHIVE)
 endif()
 
-add_executable(device-agent src/main.cpp ${PROTO_SRCS})
+add_executable(device-agent src/main.cpp src/ws_tunnel.cpp ${PROTO_SRCS})
 target_include_directories(device-agent PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-target_link_libraries(device-agent PRIVATE ${AGENT_LIBRARIES} OpenSSL::Crypto Threads::Threads)
+target_link_libraries(device-agent PRIVATE ${AGENT_LIBRARIES} OpenSSL::Crypto OpenSSL::SSL Threads::Threads ${CMAKE_DL_LIBS})
 target_compile_options(device-agent PRIVATE -Wall -Wextra -Wpedantic)
 
 option(DEVICE_AGENT_BUILD_RESPONSE_TESTS "Build offline enrollment response tests" OFF)

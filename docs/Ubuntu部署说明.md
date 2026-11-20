@@ -13,7 +13,7 @@ sha256sum -c SHA256SUMS
 cp -n device-agent.cloud.conf.example device-agent.cloud.conf
 ```
 
-编辑 `device-agent.cloud.conf`，用 `device-file` 指向只含 SN 的文件、`private-key` 指向设备私钥，并填写设备型号（`model`）；配置里不写 SN 明文，服务地址使用云端提供的值。设备公钥需先由 PC 管理工具调用 `POST /v1/device-keys/bind` 绑定到云端，Agent 只用私钥签名换 Token。编辑 `log-sources.json`，填写业务日志目录、文件匹配规则及文件名日期格式。然后从部署目录运行：
+编辑 `device-agent.cloud.conf`，填写设备身份与型号（`model`），配置里不写 SN 明文，服务地址使用云端提供的值。身份来源两种（`identity-source`，缺省 `file`）：`file` 用 `device-file` 指向只含 SN 的文件、`private-key` 指向设备私钥；RK3588 板端可设 `identity-source=vendor-storage`（库路径可用 `factory-lib` 覆盖，缺省 `libfactory_service.so.1`），经 libfactory_service 直接读 Vendor Storage 的 SN 与私钥——SN 缓存到 `state-dir/sn.cache`（token 有效时启动不读裸 eMMC 设备），私钥仅驻留内存不落盘，库加载失败自动回退 `file` 来源。设备公钥需先由 PC 管理工具调用 `POST /v1/device-keys/bind` 绑定到云端，Agent 只用私钥签名换 Token。编辑 `log-sources.json`，填写业务日志目录、文件匹配规则及文件名日期格式。然后从部署目录运行：
 
 ```bash
 ./device-agent

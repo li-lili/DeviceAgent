@@ -1,14 +1,25 @@
 # 首次克隆后复制为 device-agent.cloud.conf，再填写实际信息。
 # device-agent.cloud.conf 已被 Git 忽略，请勿强制提交真实凭证。
-# 设备身份：SN 与私钥都只给路径，配置里不写明文（文件由产线写入，Agent 只读）。
-# sn 文件只含一行 SN；私钥支持 PKCS#8 / PKCS#1 PEM 与 OpenSSH 格式（无口令）。
+# 身份来源二选一（identity-source，缺省 file）：
+# 1) vendor-storage：经 libfactory_service 直接读 RK3588 Vendor Storage 的 SN 与私钥（板端推荐）。
+#    SN 会缓存到 state-dir/sn.cache，token 有效时启动不再读裸 eMMC 设备；私钥仅驻留内存。
+# 2) file（缺省/回退）：SN 与私钥都只给路径，配置里不写明文（文件由产线写入，Agent 只读）。
+#    sn 文件只含一行 SN；私钥支持 PKCS#8 / PKCS#1 PEM 与 OpenSSH 格式（无口令）。
+#    vendor-storage 库加载失败时自动回退到这里的 device-file / private-key。
 # 无缓存 Token 时用私钥对 "noetix-enroll-v1|SN" 做 RSA-PSS 签名换取 Token。
 # 公钥需先由 PC 管理工具调用 POST /v1/device-keys/bind 绑定到云端，Agent 不执行绑定。
+# identity-source=vendor-storage
+# factory-lib=/usr/local/lib/libfactory_service.so.1
 device-file=/userdata/container/android_data/data_0/local/factory/sn.txt
 private-key=/userdata/container/android_data/data_0/local/factory/keys/device_rsa
 
-host=emqx.test.humanuniverse.cn
-port=1883
+# MQTT 连接方式二选一：
+# 1) mqtt-url：MQTT over WebSocket（仅支持 wss://）。客户端在进程内起本地环回隧道，
+#    由隧道完成 TLS 与 WebSocket 封装，适用于仅放行 443 的网络环境。
+# 2) host + port：直连 TCP，适用于放行 1883/8883 的网络（TLS 由 ca 配置启用）。
+mqtt-url=wss://mqtt.test.humanuniverse.cn/mqtt
+# host=emqx.test.humanuniverse.cn
+# port=1883
 enroll-url=https://logserver.test.humanuniverse.cn/v1/enroll
 model=devicesim
 state-dir=run/cloud-agent

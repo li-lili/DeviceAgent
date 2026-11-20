@@ -207,11 +207,19 @@ def main():
 
             private_path.write_text("not a pem key")
             write_config()
-            code, out = attempt()
-            assert code == 1 and "cannot parse private key" in out, out
+            before = len(requests)
+            pending_log = directory / "pending-key.log"
+            with pending_log.open("w") as sink:
+                pending = subprocess.Popen([str(ROOT / "build/device-agent")], cwd=directory,
+                                           stdout=sink, stderr=subprocess.STDOUT)
+            processes.append(pending)
+            wait_for(lambda: "IDENTITY waiting" in pending_log.read_text() or pending.poll() is not None)
+            assert pending.poll() is None and "IDENTITY waiting" in pending_log.read_text()
+            assert len(requests) == before and not list(token_file.parent.glob("*.tmp.*"))
+            stop(pending)
             private_path.write_bytes(device_key.private_bytes(
                 serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
-            print("PASS corrupt private key fails without creating a token cache")
+            print("PASS incomplete private key waits without requesting or creating a token cache")
 
             before = len(requests)
             write_config(url="http://not-a-loopback.invalid/v1/enroll")

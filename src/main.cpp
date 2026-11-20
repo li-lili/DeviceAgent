@@ -3,6 +3,9 @@
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/util/json_util.h>
 #include "enroll_response.h"
+#include "factory_service.h"
+#include "ws_tunnel.h"
+#include "network_ready.h"
 #include <mosquitto.h>
 #include <mqtt_protocol.h>
 #include <curl/curl.h>
@@ -19,6 +22,7 @@
 #include <fnmatch.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dlfcn.h>
 #include <cerrno>
 #include <cctype>
 #include <algorithm>
@@ -80,8 +84,61 @@ struct Failure : std::runtime_error {
     std::string code;
     Failure(std::string c, std::string m) : std::runtime_error(m), code(std::move(c)) {}
 };
+// Provisioning may happen after boot. Only local missing/incomplete identity is retryable.
+struct IdentityPending : std::runtime_error { using std::runtime_error::runtime_error; };
+struct StartupStopped {};
+template<class Read>
+static auto wait_for_identity(const char* item,Read read) -> decltype(read()) {
+    bool waited=false;
+    while(!stopping) {
+        try {
+            auto value=read();
+            if(waited)log(std::string("IDENTITY ready item=")+item);
+            return value;
+        }catch(const IdentityPending& e) {
+            waited=true;
+            log(std::string("IDENTITY waiting item=")+item+"; "+e.what()+"; retry interval=10s");
+        }
+        for(int i=0;i<100&&!stopping;++i)std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    throw StartupStopped{};
+}
 // 限制命令、业务、来源 ID 的字符，避免路径分隔符进入状态文件名。
 static bool identifier(const std::string& s) { return std::regex_match(s, std::regex("[A-Za-z0-9_.-]{1,64}")) && s != "." && s != ".."; }
+// libfactory_service 从 RK3588 Vendor Storage 读取 SN 与私钥，只在产线板端（aarch64）部署。
+// 通过 dlopen 运行时加载；库缺失或符号不全时告警并回退 file 身份来源。句柄不 dlclose，随进程退出回收。
+struct FactoryService {
+    void* handle=nullptr;
+    int (*read_sn)(char*,size_t)=nullptr;
+    int (*read_privkey)(char*,size_t)=nullptr;
+    const char* (*describe)(int)=nullptr;
+};
+static std::shared_ptr<FactoryService> load_factory_service(const fs::path& lib) {
+    auto service=std::make_shared<FactoryService>();
+    service->handle=dlopen(lib.c_str(),RTLD_NOW|RTLD_LOCAL);
+    if(!service->handle) {
+        if(const char* error=dlerror())
+            log(std::string("IDENTITY cannot load factory service library: ")+error,LogLevel::Warning);
+        return nullptr;
+    }
+    service->read_sn=reinterpret_cast<int(*)(char*,size_t)>(dlsym(service->handle,"fs_read_sn"));
+    service->read_privkey=reinterpret_cast<int(*)(char*,size_t)>(dlsym(service->handle,"fs_read_privkey"));
+    service->describe=reinterpret_cast<const char*(*)(int)>(dlsym(service->handle,"fs_strerror"));
+    if(!service->read_sn||!service->read_privkey) {
+        log("IDENTITY factory service library is missing required symbols",LogLevel::Warning);
+        return nullptr;
+    }
+    return service;
+}
+// Vendor Storage 读取失败的统一描述：未烧写指向产线注入，权限问题指向运行用户。
+static std::string vendor_error(const FactoryService& service,int status) {
+    if(status==FS_ERR_ITEM_NOT_FOUND||status==FS_ERR_SN_INVALID||status==FS_ERR_KEY_INVALID)
+        return "vendor storage has no SN or private key provisioned; inject it via the factory line first";
+    if(status==FS_ERR_PERMISSION)
+        return "cannot access vendor storage; run as root or with the disk group to read the raw eMMC device";
+    const char* text=service.describe?service.describe(status):nullptr;
+    return std::string("vendor storage read failed: ")+(text&&*text?text:"status "+std::to_string(status));
+}
 // 按路径组件判断是否位于根目录内；调用方先规范化路径，不能只比较字符串前缀。
 static bool inside(const fs::path& file, const fs::path& root) {
     auto f = file.begin(), r = root.begin();
@@ -162,10 +219,14 @@ struct Options {
     std::string host, device, username, token, ca;
     std::string local_host, local_username, local_token, local_ca;
     std::string enroll_url, model, serial;
+    std::string mqtt_url; // wss:// 地址；非空时经本地隧道转发，host/port 由隧道接管。
     std::string https_ca; // 注册和对象存储上传使用的 PEM CA 证书包；与 MQTT ca 分开。
     fs::path token_file;
     fs::path private_key; // 签名换 Token 的设备私钥 PEM，由产线/PC 工具写入，只读。
     fs::path device_file; // 只含 SN 的文件；SN 不写明文，读取后填入 device。
+    std::string identity_source="file"; // file（缺省）走 device-file/private-key；vendor-storage 经 libfactory_service 读 Vendor Storage。
+    fs::path factory_lib; // vendor-storage 模式的 libfactory_service 路径覆盖；缺省 libfactory_service.so.1。
+    std::shared_ptr<FactoryService> factory; // vendor-storage 模式成功加载的库句柄；回退 file 时为空。
     int port=0;
     int local_port=0;
     fs::path state, work, sources_config, log_path;
@@ -249,55 +310,55 @@ struct SshReader {
     }
 };
 // 去掉 PEM 头尾并拼接 Base64；返回解码后的二进制。
-static std::string decode_openssh_base64(const std::string& text,const fs::path& path) {
+static std::string decode_openssh_base64(const std::string& text,const std::string& origin) {
     const std::string begin="-----BEGIN OPENSSH PRIVATE KEY-----";
     const std::string end="-----END OPENSSH PRIVATE KEY-----";
     auto start=text.find(begin);
     auto stop=text.find(end);
     if(start==std::string::npos||stop==std::string::npos||stop<start)
-        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+origin);
     std::string body;
     for(char c:text.substr(start+begin.size(),stop-start-begin.size()))
         if(!std::isspace(static_cast<unsigned char>(c)))body.push_back(c);
-    if(body.empty()||body.size()%4)throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+    if(body.empty()||body.size()%4)throw Failure("ENROLL_FAILED","cannot parse private key: "+origin);
     std::string blob(body.size()/4*3,'\0');
     int decoded=EVP_DecodeBlock(reinterpret_cast<unsigned char*>(blob.data()),
         reinterpret_cast<const unsigned char*>(body.data()),static_cast<int>(body.size()));
-    if(decoded<0)throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+    if(decoded<0)throw Failure("ENROLL_FAILED","cannot parse private key: "+origin);
     size_t padding=0;
     while(padding<body.size()&&body[body.size()-1-padding]=='=')++padding;
     blob.resize(static_cast<size_t>(decoded)-padding);
     return blob;
 }
-static EVP_PKEY* read_openssh_private_key(const std::string& text,const fs::path& path) {
-    const std::string blob=decode_openssh_base64(text,path);
+static EVP_PKEY* read_openssh_private_key(const std::string& text,const std::string& origin) {
+    const std::string blob=decode_openssh_base64(text,origin);
     const std::string magic("openssh-key-v1\0",15);
     if(blob.size()<magic.size()||blob.compare(0,magic.size(),magic)!=0)
-        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+origin);
     SshReader head{reinterpret_cast<const unsigned char*>(blob.data()),blob.size(),magic.size()};
     std::string cipher,kdf,kdf_options;
     if(!head.text(cipher)||!head.text(kdf)||!head.text(kdf_options))
-        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+origin);
     if(cipher!="none"||kdf!="none")
-        throw Failure("ENROLL_FAILED","encrypted OpenSSH private key is not supported: "+path.string());
+        throw Failure("ENROLL_FAILED","encrypted OpenSSH private key is not supported: "+origin);
     uint32_t count=0;
     const unsigned char* raw=nullptr;
     size_t length=0;
     if(!head.u32(count)||count!=1||!head.bytes(raw,length)||!head.bytes(raw,length))
-        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+origin);
     SshReader body{raw,length};
     uint32_t check1=0,check2=0;
     std::string kind;
     if(!body.u32(check1)||!body.u32(check2)||check1!=check2||!body.text(kind))
-        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+origin);
     if(kind!="ssh-rsa")
-        throw Failure("ENROLL_FAILED","unsupported OpenSSH key type "+kind+": "+path.string());
+        throw Failure("ENROLL_FAILED","unsupported OpenSSH key type "+kind+": "+origin);
     // OpenSSH 的 RSA 私钥字段顺序：n、e、d、iqmp、p、q。
     const unsigned char* fields[6]={};
     size_t sizes[6]={};
     for(int i=0;i<6;++i)
         if(!body.bytes(fields[i],sizes[i]))
-            throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+            throw Failure("ENROLL_FAILED","cannot parse private key: "+origin);
     std::unique_ptr<BIGNUM,decltype(&BN_free)> n(BN_bin2bn(fields[0],sizes[0],nullptr),BN_free);
     std::unique_ptr<BIGNUM,decltype(&BN_free)> e(BN_bin2bn(fields[1],sizes[1],nullptr),BN_free);
     std::unique_ptr<BIGNUM,decltype(&BN_free)> d(BN_bin2bn(fields[2],sizes[2],nullptr),BN_free);
@@ -314,7 +375,7 @@ static EVP_PKEY* read_openssh_private_key(const std::string& text,const fs::path
         ||!BN_sub_word(pm1.get(),1)||!BN_sub_word(qm1.get(),1)
         ||!BN_mod(dmp1.get(),d.get(),pm1.get(),ctx.get())
         ||!BN_mod(dmq1.get(),d.get(),qm1.get(),ctx.get()))
-        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+origin);
     std::unique_ptr<OSSL_PARAM_BLD,decltype(&OSSL_PARAM_BLD_free)> builder(OSSL_PARAM_BLD_new(),OSSL_PARAM_BLD_free);
     if(!builder
         ||!OSSL_PARAM_BLD_push_BN(builder.get(),OSSL_PKEY_PARAM_RSA_N,n.get())
@@ -325,31 +386,45 @@ static EVP_PKEY* read_openssh_private_key(const std::string& text,const fs::path
         ||!OSSL_PARAM_BLD_push_BN(builder.get(),OSSL_PKEY_PARAM_RSA_EXPONENT1,dmp1.get())
         ||!OSSL_PARAM_BLD_push_BN(builder.get(),OSSL_PKEY_PARAM_RSA_EXPONENT2,dmq1.get())
         ||!OSSL_PARAM_BLD_push_BN(builder.get(),OSSL_PKEY_PARAM_RSA_COEFFICIENT1,iqmp.get()))
-        throw Failure("ENROLL_FAILED","cannot build private key: "+path.string());
+        throw Failure("ENROLL_FAILED","cannot build private key: "+origin);
     std::unique_ptr<OSSL_PARAM,decltype(&OSSL_PARAM_free)> params(OSSL_PARAM_BLD_to_param(builder.get()),OSSL_PARAM_free);
     std::unique_ptr<EVP_PKEY_CTX,decltype(&EVP_PKEY_CTX_free)> key_ctx(
         EVP_PKEY_CTX_new_from_name(nullptr,"RSA",nullptr),EVP_PKEY_CTX_free);
     EVP_PKEY* key=nullptr;
     if(!params||!key_ctx||EVP_PKEY_fromdata_init(key_ctx.get())<=0
         ||EVP_PKEY_fromdata(key_ctx.get(),&key,EVP_PKEY_KEYPAIR,params.get())<=0)
-        throw Failure("ENROLL_FAILED","cannot build private key: "+path.string());
+        throw Failure("ENROLL_FAILED","cannot build private key: "+origin);
     return key;
 }
 // Token 优先级与 Python 模拟器一致：配置 token → 已保存 token-file → 签名换 Token。
 // 设备私钥由产线/PC 工具流程预先写入安全存储，Agent 只读取，绝不生成或修改。
-// 先按 PEM（PKCS#8 / PKCS#1）解析，失败再按 OpenSSH 格式解析，兼容产线 device_rsa。
-static std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)> read_private_key(const fs::path& path) {
-    FILE* file=fopen(path.c_str(),"r");
-    if(!file)throw Failure("ENROLL_FAILED","cannot open private key: "+path.string());
-    EVP_PKEY* key=PEM_read_PrivateKey(file,nullptr,nullptr,nullptr);
-    fclose(file);
-    if(key)return {key,&EVP_PKEY_free};
-    std::ifstream input(path,std::ios::binary);
-    if(!input)throw Failure("ENROLL_FAILED","cannot open private key: "+path.string());
-    std::string text((std::istreambuf_iterator<char>(input)),std::istreambuf_iterator<char>());
+// 解析内存中的私钥文本：先按 PEM（PKCS#8 / PKCS#1），失败再按 OpenSSH 格式；
+// origin 仅用于错误定位（文件路径或 "vendor storage"），不回显内容。
+static std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)> parse_private_key_text(const std::string& text,const std::string& origin) {
+    BIO* bio=BIO_new_mem_buf(text.data(),static_cast<int>(text.size()));
+    if(!bio)throw Failure("ENROLL_FAILED","cannot parse private key: "+origin);
+    std::unique_ptr<BIO,decltype(&BIO_free)> bio_owner(bio,BIO_free);
+    if(EVP_PKEY* key=PEM_read_bio_PrivateKey(bio,nullptr,nullptr,nullptr))return {key,&EVP_PKEY_free};
     if(text.find("-----BEGIN OPENSSH PRIVATE KEY-----")==std::string::npos)
-        throw Failure("ENROLL_FAILED","cannot parse private key: "+path.string());
-    return {read_openssh_private_key(text,path),&EVP_PKEY_free};
+        throw Failure("ENROLL_FAILED","cannot parse private key: "+origin);
+    return {read_openssh_private_key(text,origin),&EVP_PKEY_free};
+}
+static std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)> read_private_key(const fs::path& path) {
+    std::ifstream input(path,std::ios::binary);
+    if(!input) {
+        if(!fs::exists(path))throw IdentityPending("private key file has not been written: "+path.string());
+        throw Failure("ENROLL_FAILED","cannot open private key: "+path.string());
+    }
+    std::string text((std::istreambuf_iterator<char>(input)),std::istreambuf_iterator<char>());
+    if(input.bad())throw Failure("ENROLL_FAILED","cannot read private key: "+path.string());
+    try {
+        auto key=parse_private_key_text(text,path.string());
+        OPENSSL_cleanse(text.data(),text.size());
+        return key;
+    }catch(const Failure&) {
+        OPENSSL_cleanse(text.data(),text.size());
+        throw IdentityPending("private key file is empty, incomplete or invalid: "+path.string());
+    }
 }
 
 // 对 "noetix-enroll-v1|"+SN 做 RSA-PSS(SHA-256, MGF1-SHA256, salt=digest 长度 32 字节) 签名，
@@ -378,27 +453,148 @@ static std::string make_enroll_signature(const std::string& sn,EVP_PKEY* key) {
         bytes.data(),static_cast<int>(length)));
     return signature;
 }
-// SN 不写明文：device-file 指向只含 SN 的文本文件，去掉首尾空白后作为设备标识。
-// 同时写了 device 时只允许完全一致，避免主题、Token 缓存与密钥错配。
-static void load_device(Options& o) {
-    if(o.device_file.empty())return;
-    std::ifstream input(o.device_file,std::ios::binary);
-    if(!input)throw std::runtime_error("cannot read device-file: "+o.device_file.string());
-    std::string sn;
-    char buffer[256];
-    while(input.read(buffer,sizeof buffer)||input.gcount()) {
-        sn.append(buffer,static_cast<size_t>(input.gcount()));
-        if(sn.size()>1024)throw std::runtime_error("device-file is too large: "+o.device_file.string());
-    }
-    if(input.bad())throw std::runtime_error("cannot read device-file: "+o.device_file.string());
+// 从 Vendor Storage 读 SN：去掉首尾空白与文件来源对齐；失败原因指向产线注入或运行权限。
+static std::string vendor_sn(const FactoryService& service) {
+    std::vector<char> buffer(FS_SN_BUFSZ,'\0');
+    int status=service.read_sn(buffer.data(),buffer.size());
+    if(status==FS_ERR_ITEM_NOT_FOUND||status==FS_ERR_NO_VALID_SLOT||status==FS_ERR_SN_INVALID)
+        throw IdentityPending("vendor storage SN has not been provisioned");
+    if(status!=FS_OK)throw std::runtime_error(vendor_error(service,status));
+    std::string sn(buffer.data());
     auto first=sn.find_first_not_of(" \t\r\n"),last=sn.find_last_not_of(" \t\r\n");
     sn=first==std::string::npos?std::string():sn.substr(first,last-first+1);
-    if(!identifier(sn))throw std::runtime_error("device-file has no valid sn: "+o.device_file.string());
-    if(!o.device.empty()&&o.device!=sn)
-        throw std::runtime_error("device conflicts with device-file sn: "+o.device+" != "+sn);
-    o.device=sn;
+    if(!identifier(sn))
+        throw IdentityPending("vendor storage SN is empty, incomplete or invalid; inject it via the factory line first");
+    return sn;
+}
+// 从 Vendor Storage 读私钥并直接在内存解析：密钥材料不落盘、不写日志，缓冲区用后立即清除。
+static std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)> vendor_private_key(const FactoryService& service) {
+    std::vector<char> buffer(FS_KEY_BUFSZ,'\0');
+    int status=service.read_privkey(buffer.data(),buffer.size());
+    if(status==FS_ERR_ITEM_NOT_FOUND||status==FS_ERR_NO_VALID_SLOT||status==FS_ERR_KEY_INVALID)
+        throw IdentityPending("vendor storage private key has not been provisioned or is invalid");
+    if(status!=FS_OK)throw Failure("ENROLL_FAILED",vendor_error(service,status));
+    std::string text(buffer.data());
+    OPENSSL_cleanse(buffer.data(),buffer.size());
+    try {
+        auto key=parse_private_key_text(text,"vendor storage");
+        OPENSSL_cleanse(text.data(),text.size());
+        return key;
+    }catch(const Failure&) {
+        OPENSSL_cleanse(text.data(),text.size());
+        throw IdentityPending("vendor storage private key is empty, incomplete or invalid");
+    }
+}
+// SN 本地缓存（vendor-storage 模式）：token 仍有效时启动直接用缓存 SN，不读裸 eMMC 设备。
+// 明文 SN、0600，与 token / sn.txt 同级敏感度；"配置不写 SN 明文"的原则不变。
+static bool read_sn_cache(const fs::path& path,std::string& sn) {
+    std::ifstream input(path,std::ios::binary);
+    if(!input)return false;
+    std::string text((std::istreambuf_iterator<char>(input)),std::istreambuf_iterator<char>());
+    if(input.bad())return false;
+    auto first=text.find_first_not_of(" \t\r\n"),last=text.find_last_not_of(" \t\r\n");
+    sn=first==std::string::npos?std::string():text.substr(first,last-first+1);
+    return identifier(sn);
+}
+// 原子写 SN 缓存（临时文件 + fsync + rename）；失败仅告警不阻断启动，下次启动改由 Vendor Storage 重读。
+static void write_sn_cache(const fs::path& path,const std::string& sn) {
+    try {
+        fs::create_directories(path.parent_path());
+        auto temporary=path;temporary+=".tmp."+std::to_string(getpid());
+        int fd=open(temporary.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
+        if(fd<0)throw std::runtime_error("cannot create "+temporary.string());
+        size_t offset=0;
+        while(offset<sn.size()) {
+            auto count=write(fd,sn.data()+offset,sn.size()-offset);
+            if(count<0&&errno==EINTR)continue;
+            if(count<=0){close(fd);throw std::runtime_error("cannot write "+temporary.string());}
+            offset+=static_cast<size_t>(count);
+        }
+        if(fsync(fd)!=0){close(fd);throw std::runtime_error("cannot sync "+temporary.string());}
+        if(close(fd)!=0)throw std::runtime_error("cannot close "+temporary.string());
+        fs::rename(temporary,path);
+    }catch(const std::exception& e){log(std::string("IDENTITY ")+e.what(),LogLevel::Warning);}
+}
+// SN 不写明文：file 来源从 device-file 读单行 SN；vendor-storage 来源经 libfactory_service 读 Vendor Storage。
+// 同时写了 device 时只允许完全一致，避免主题、Token 缓存与密钥错配。
+static void load_device(Options& o) {
+    std::string sn,origin;
+    if(o.identity_source=="vendor-storage") {
+        if(!o.factory)o.factory=load_factory_service(o.factory_lib.empty()?fs::path("libfactory_service.so.1"):o.factory_lib);
+        if(o.factory) {
+            origin="vendor storage";
+            fs::path cache=o.state/"sn.cache";
+            if(read_sn_cache(cache,sn))log("IDENTITY loaded sn from cache: "+cache.string());
+            else {
+                sn=vendor_sn(*o.factory);
+                write_sn_cache(cache,sn);
+            }
+        } else {
+            log("IDENTITY factory service unavailable; falling back to file identity",LogLevel::Warning);
+            if(o.device_file.empty())
+                throw std::runtime_error("cannot load factory service library and no device-file fallback is configured");
+        }
+    }
+    if(sn.empty()&&!o.device_file.empty()) {
+        origin="device-file";
+        std::ifstream input(o.device_file,std::ios::binary);
+        if(!input) {
+            if(!fs::exists(o.device_file))throw IdentityPending("SN file has not been written: "+o.device_file.string());
+            throw std::runtime_error("cannot read device-file: "+o.device_file.string());
+        }
+        char buffer[256];
+        while(input.read(buffer,sizeof buffer)||input.gcount()) {
+            sn.append(buffer,static_cast<size_t>(input.gcount()));
+            if(sn.size()>1024)throw std::runtime_error("device-file is too large: "+o.device_file.string());
+        }
+        if(input.bad())throw std::runtime_error("cannot read device-file: "+o.device_file.string());
+        auto first=sn.find_first_not_of(" \t\r\n"),last=sn.find_last_not_of(" \t\r\n");
+        sn=first==std::string::npos?std::string():sn.substr(first,last-first+1);
+        if(!identifier(sn))throw IdentityPending("SN file is empty, incomplete or invalid: "+o.device_file.string());
+    }
+    if(!sn.empty()) {
+        if(!o.device.empty()&&o.device!=sn)
+            throw std::runtime_error("device conflicts with "+origin+" sn: "+o.device+" != "+sn);
+        o.device=sn;
+    }
 }
 // 文件存在但为空或无法读取时明确失败，避免误把缓存损坏当成新设备而重复注册。
+// Wait inside this process so systemd does not restart enrollment while Wi-Fi/DNS is down.
+static bool wait_for_cloud_network(const Options& o) {
+    if(o.enroll_url.empty()&&o.mqtt_url.empty())return !stopping;
+    if(!o.enroll_url.empty()) {
+        bool https=o.enroll_url.rfind("https://",0)==0;
+        bool loopback=o.enroll_url.rfind("http://127.0.0.1:",0)==0||o.enroll_url.rfind("http://localhost:",0)==0;
+        if(!https&&!(o.insecure_enroll&&loopback))
+            throw Failure("ENROLL_FAILED","enroll-url requires HTTPS; loopback HTTP is only allowed in local tests");
+    }
+    std::vector<network_ready::Target> targets;
+    if(!o.enroll_url.empty())targets.push_back(network_ready::target("enroll",o.enroll_url));
+    if(!o.mqtt_url.empty())targets.push_back(network_ready::target("mqtt",o.mqtt_url));
+    else {
+        std::string host=o.host;
+        if(host.find(':')!=std::string::npos&&host.front()!='[')host="["+host+"]";
+        targets.push_back(network_ready::target("mqtt","http://"+host+":"+std::to_string(o.port)));
+    }
+    log("NETWORK waiting for configured cloud endpoints (DNS + TCP); retry interval=5s");
+    while(!stopping) {
+        bool ready=true;
+        for(const auto& endpoint:targets) {
+            if(stopping)return false;
+            std::string reason;
+            bool connected=network_ready::probe(endpoint,stopping,reason);
+            if(stopping)return false;
+            if(!connected) {
+                ready=false;
+                log("NETWORK waiting target="+endpoint.label+" host="+endpoint.host+" port="+endpoint.port+" reason="+reason);
+            }
+        }
+        if(ready){log("NETWORK ready; all configured cloud endpoints resolved and TCP reachable");return true;}
+        for(int i=0;i<50&&!stopping;++i)std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+
 static void resolve_token(Options& o) {
     auto valid_token=enrollment::valid_token;
     if(!o.token.empty()) {
@@ -425,13 +621,26 @@ static void resolve_token(Options& o) {
         if(o.username.empty())o.username=o.device;
         log("AUTH loaded cached device token: "+token_path.string());return;
     }
-    if(o.private_key.empty()||o.enroll_url.empty())
+    if(o.enroll_url.empty()||(o.private_key.empty()&&!o.factory))
         throw Failure("ENROLL_FAILED","token is missing; set private-key and enroll-url");
     bool https=o.enroll_url.rfind("https://",0)==0;
     bool loopback=o.enroll_url.rfind("http://127.0.0.1:",0)==0||o.enroll_url.rfind("http://localhost:",0)==0;
     if(!https&&!(o.insecure_enroll&&loopback))
         throw Failure("ENROLL_FAILED","enroll-url requires HTTPS; loopback HTTP is only allowed in local tests");
 
+    // Re-read the SN on each key-read attempt: provisioning can update both while we wait.
+    std::string enroll_sn=o.device;
+    auto device_key=wait_for_identity("SN/private-key",[&] {
+        if(o.factory)enroll_sn=vendor_sn(*o.factory);
+        return o.factory?vendor_private_key(*o.factory):read_private_key(o.private_key);
+    });
+    if(enroll_sn!=o.device) {
+        log("IDENTITY vendor storage sn changed: "+o.device+" -> "+enroll_sn,LogLevel::Warning);
+        o.device=enroll_sn;
+        write_sn_cache(o.state/"sn.cache",enroll_sn);
+        token_path=o.token_file.empty()?o.state/"tokens"/(o.device+".token"):o.token_file;
+    }
+    if(stopping)throw StartupStopped{};
     fs::path parent=fs::absolute(token_path).parent_path();
     fs::create_directories(parent);
     auto temporary=token_path;temporary+=".tmp."+std::to_string(getpid());
@@ -440,7 +649,6 @@ static void resolve_token(Options& o) {
     if(fd<0)throw Failure("ENROLL_FAILED","cannot create token cache: "+token_path.string());
     try {
         // 云端协议固定两字段：sn + 签名；不再携带 model、serial 等其他身份信息。
-        auto device_key=read_private_key(o.private_key);
         std::string signature=make_enroll_signature(o.device,device_key.get());
         google::protobuf::Struct body;
         auto& fields=*body.mutable_fields();
@@ -526,6 +734,7 @@ class Agent {
     Options opts;
     mosquitto* mqtt=nullptr;
     mosquitto* local_mqtt=nullptr;
+    std::unique_ptr<ws_tunnel::Tunnel> ws_tunnel; // 配置 mqtt-url 时的本地 WSS 转发端。
     std::string boot, up, down, local;
     std::mutex mutex;
     std::condition_variable cv;
@@ -926,6 +1135,18 @@ public:
         std::ifstream bootfile("/proc/sys/kernel/random/boot_id");std::getline(bootfile,boot);if(boot.empty())boot=std::to_string(now_ns());
         // 根据设备 ID 构造云端上行、下行及兼容模式的业务主题前缀。
         up="v1/d/"+opts.device+"/up/";down="v1/d/"+opts.device+"/down/";local="local/v1/"+opts.device+"/biz/";
+        // 配置 mqtt-url 时先启动本地隧道：MQTT 客户端仍走明文 TCP，由隧道封装为 WebSocket 并完成 TLS。
+        if(!opts.mqtt_url.empty()) {
+            ws_tunnel::Config config;
+            config.url=opts.mqtt_url;
+            config.ca_path=opts.ca; // 复用 MQTT 的 CA 配置；为空时使用系统信任库。
+            config.log=[](const std::string& message){log(message,LogLevel::Warning);};
+            ws_tunnel=std::make_unique<ws_tunnel::Tunnel>(std::move(config));
+            ws_tunnel->start();
+            opts.host="127.0.0.1";
+            opts.port=ws_tunnel->port();
+            log("MQTT WSS tunnel listening on 127.0.0.1:"+std::to_string(opts.port)+" -> "+opts.mqtt_url);
+        }
         mqtt=mosquitto_new(opts.device.c_str(),true,this);
         local_mqtt=mosquitto_new(("agent-local-"+opts.device).c_str(),true,this);
         if(!mqtt||!local_mqtt)throw std::runtime_error("MQTT init failed");
@@ -933,7 +1154,8 @@ public:
         mosquitto_int_option(local_mqtt,MOSQ_OPT_PROTOCOL_VERSION,MQTT_PROTOCOL_V5);
         if(!opts.username.empty())mosquitto_username_pw_set(mqtt,opts.username.c_str(),opts.token.c_str());
         if(!opts.local_username.empty())mosquitto_username_pw_set(local_mqtt,opts.local_username.c_str(),opts.local_token.c_str());
-        if(!opts.ca.empty()){int rc=mosquitto_tls_set(mqtt,opts.ca.c_str(),nullptr,nullptr,nullptr,nullptr);if(rc)throw std::runtime_error(mosquitto_strerror(rc));}
+        // WSS 模式下本地这一段是明文环回，TLS 由隧道完成，不再给 MQTT 客户端设置 TLS。
+        if(opts.mqtt_url.empty()&&!opts.ca.empty()){int rc=mosquitto_tls_set(mqtt,opts.ca.c_str(),nullptr,nullptr,nullptr,nullptr);if(rc)throw std::runtime_error(mosquitto_strerror(rc));}
         if(!opts.local_ca.empty()){int rc=mosquitto_tls_set(local_mqtt,opts.local_ca.c_str(),nullptr,nullptr,nullptr,nullptr);if(rc)throw std::runtime_error(mosquitto_strerror(rc));}
         mosquitto_reconnect_delay_set(mqtt,1,60,true);
         mosquitto_reconnect_delay_set(local_mqtt,1,60,true);
@@ -959,17 +1181,24 @@ public:
     }
     // 前台运行：启动网络和工作线程，主线程等待退出信号。文件模式只连接云端 MQTT。
     void run() {
-        log("MQTT cloud connecting host="+opts.host+" port="+std::to_string(opts.port)+" device="+opts.device);
+        log(opts.mqtt_url.empty()
+            ?"MQTT cloud connecting host="+opts.host+" port="+std::to_string(opts.port)+" device="+opts.device
+            :"MQTT cloud connecting via WSS tunnel "+opts.mqtt_url+" local="+opts.host+":"+std::to_string(opts.port)+" device="+opts.device);
         int rc=mosquitto_connect_async(mqtt,opts.host.c_str(),opts.port,30);if(rc)throw std::runtime_error(mosquitto_strerror(rc));
-        if(opts.sources_config.empty()) {
+        if(opts.sources_config.empty()&&!opts.local_host.empty()) {
             rc=mosquitto_connect_async(local_mqtt,opts.local_host.c_str(),opts.local_port?opts.local_port:opts.port,30);if(rc)throw std::runtime_error(mosquitto_strerror(rc));
             mosquitto_loop_start(local_mqtt);
         }
         mosquitto_loop_start(mqtt);worker=std::thread(&Agent::work_loop,this);
         while(!stopping)std::this_thread::sleep_for(std::chrono::milliseconds(100));
         // 退出时先唤醒并回收 worker，再停止网络；进行中的 HTTP 可能等到超时才返回。
-        cv.notify_all();worker.join();mosquitto_disconnect(mqtt);mosquitto_loop_stop(mqtt,true);
-        if(opts.sources_config.empty()){mosquitto_disconnect(local_mqtt);mosquitto_loop_stop(local_mqtt,true);}
+        cv.notify_all();worker.join();
+        // 正常 DISCONNECT 不会触发遗嘱，这里主动上报离线并留出发送时间，避免云端长期显示在线。
+        cloud_pb::Presence offline;offline.set_online(false);offline.set_boot_id(boot);offline.set_sent_wall_ns(now_ns());
+        publish(up+"presence",offline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        mosquitto_disconnect(mqtt);mosquitto_loop_stop(mqtt,true);
+        if(opts.sources_config.empty()&&!opts.local_host.empty()){mosquitto_disconnect(local_mqtt);mosquitto_loop_stop(local_mqtt,true);}
     }
     ~Agent(){if(mqtt)mosquitto_destroy(mqtt);if(local_mqtt)mosquitto_destroy(local_mqtt);}
 };
@@ -1021,9 +1250,12 @@ static Options load_options(const fs::path& config,int depth=0,std::string envir
                 return parsed;
             };
             if(key=="host")o.host=value;
+            else if(key=="mqtt-url")o.mqtt_url=value;
             else if(key=="port")o.port=port(false);
             else if(key=="device")o.device=value;
             else if(key=="device-file")o.device_file=path_value(value);
+            else if(key=="identity-source")o.identity_source=value;
+            else if(key=="factory-lib")o.factory_lib=path_value(value);
             else if(key=="allowed-root")log("CONFIG allowed-root is obsolete and ignored",LogLevel::Warning);
             else if(key=="enrollment-key")log("CONFIG enrollment-key is obsolete and ignored",LogLevel::Warning);
             else if(key=="log-file")o.log_path=path_value(value);
@@ -1066,10 +1298,16 @@ static Options load_options(const fs::path& config,int depth=0,std::string envir
         return load_options(base/("device-agent."+environment+".conf"),depth+1,environment);
     }
     log("CONFIG profile="+fs::absolute(config).string()+" environment="+environment+" cloud-wire=json");
-    load_device(o);
-    if(!identifier(o.device))throw std::runtime_error("invalid device in "+config.string());
+    if(o.identity_source!="file"&&o.identity_source!="vendor-storage")
+        throw std::runtime_error("identity-source must be file or vendor-storage in "+config.string());
+    if(!o.device.empty()&&!identifier(o.device))throw std::runtime_error("invalid device in "+config.string());
     if(o.state.empty()||o.work.empty())throw std::runtime_error("state-dir and work-dir must not be empty");
-    if(o.host.empty()||!o.port)throw std::runtime_error("host and port are required");
+    // mqtt-url 与 host/port 二选一：前者由本地 WSS 隧道接管明文连接。
+    if(o.mqtt_url.empty()) {
+        if(o.host.empty()||!o.port)throw std::runtime_error("host and port are required");
+    } else if(o.mqtt_url.rfind("wss://",0)!=0) {
+        throw std::runtime_error("mqtt-url must start with wss://");
+    }
     if(o.local_host.empty())o.local_host=o.host;
     return o;
 }
@@ -1089,6 +1327,11 @@ int main() {
             if(!log_file)throw std::runtime_error("cannot open log file: "+o.log_path.string());
         }
         log("START device-agent; log: "+(o.log_path.empty()?std::string("disabled"):fs::absolute(o.log_path).string()));
+        wait_for_identity("SN",[&] {
+            load_device(o);
+            if(!identifier(o.device))throw IdentityPending("SN has not been provisioned");
+            return true;
+        });
         if(!o.https_ca.empty()&&!fs::is_regular_file(o.https_ca))
             throw std::runtime_error("HTTPS CA bundle is missing: "+o.https_ca);
         // 创建 Agent 前初始化网络库，Agent 析构后再清理。
@@ -1096,8 +1339,10 @@ int main() {
         if(curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK){mosquitto_lib_cleanup();throw std::runtime_error("curl initialization failed");}
         // 注册或连接失败也要清理全局网络资源；Token 必须先保存，再建立 MQTT 连接。
         struct NetworkCleanup { ~NetworkCleanup(){curl_global_cleanup();mosquitto_lib_cleanup();} } cleanup;
+        if(!wait_for_cloud_network(o)){log("STOP device-agent while waiting for network");return 0;}
         resolve_token(o);
         {Agent agent(o);agent.run();}
         log("STOP device-agent");return 0;
-    }catch(const std::exception& e){log(std::string("FATAL ")+e.what(),LogLevel::Error);return 1;}
+    }catch(const StartupStopped&){log("STOP device-agent while waiting for identity");return 0;}
+    catch(const std::exception& e){log(std::string("FATAL ")+e.what(),LogLevel::Error);return 1;}
 }
